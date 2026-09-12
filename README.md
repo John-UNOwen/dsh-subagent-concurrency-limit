@@ -48,24 +48,8 @@ each command and path.
 Install the plugin:
 
 ```sh
-dsh plugin --profile web add \
-  github:blauerberg/dsh-subagent-concurrency-limit#01182275695067510a187cb05b46df49e5fe812c
+dsh plugin --profile web add dsh-subagent-concurrency-limit
 ```
-
-Git installs fetch the source and build `lib/` with the package's `prepare`
-script. With pnpm 10 or later, the first command may stop because that build is
-not allowed. Add the revision-specific key to the profile's workspace file
-(keep any existing `allowBuilds` entries):
-
-```yaml
-# $DSH_HOME/profiles/web/pnpm-workspace.yaml
-allowBuilds:
-  'dsh-subagent-concurrency-limit@https://codeload.github.com/blauerberg/dsh-subagent-concurrency-limit/tar.gz/01182275695067510a187cb05b46df49e5fe812c': true
-```
-
-Save the file, then rerun the install command above. The commit hash used in
-both places identifies `v0.1.0`. Installing another revision requires its
-commit hash in both places.
 
 Add the plugin configuration to
 `$DSH_HOME/profiles/web/cordis.patch.yml`:
@@ -90,12 +74,31 @@ Start the profile:
 dsh --profile web
 ```
 
+## Update
+
+To update the installed plugin to the latest npm release, run:
+
+```sh
+dsh plugin --profile web add dsh-subagent-concurrency-limit@latest
+```
+
+Restart the profile after updating.
+
 ## Development
 
 ```sh
 pnpm install
 pnpm run check
 ```
+
+To inspect the package before publishing:
+
+```sh
+npm pack --dry-run
+```
+
+`prepare` builds `lib/` when packing or publishing. `npm publish` runs the
+checks through `prepublishOnly` before publishing to npm.
 
 ## License
 

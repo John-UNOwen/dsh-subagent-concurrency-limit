@@ -40,7 +40,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test tests/*.spec.ts",
     "check": "pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run build",
-    "prepare": "tsc -p tsconfig.json"
+    "prepare": "tsc -p tsconfig.json",
+    "prepublishOnly": "pnpm run check"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0",
