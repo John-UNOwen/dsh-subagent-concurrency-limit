@@ -33,6 +33,14 @@ one process-local pool. The default limit is `2`.
   their Agent turn starts.
 - A permit is released when the child turn becomes idle, the run ends, or the
   Agent is disposed.
+- Pool waits are bounded: a root delegation call or a resumed local child turn
+  that has been queued for `queueTimeoutMs` (default 300000, five minutes) fails
+  with a clear error instead of waiting forever.
+- A locally published child whose reservation was lost (for example a
+  background job that published outside the delegating call's async context)
+  never queues: it takes a permit immediately when one is free and fails loudly
+  when the pool is full, so it cannot block the ancestor that is waiting for
+  it.
 - For remote-process providers such as Codex, Claude Code, and ACP, only the
   configured root delegation admission and the observable `subagent/start` and
   `subagent/end` boundaries are visible. Nested execution and restarts inside
@@ -59,11 +67,14 @@ Add the plugin configuration to
   name: dsh-subagent-concurrency-limit
   config:
     maxConcurrentSubagents: 2
+    queueTimeoutMs: 300000
     subagentToolNames:
       - subagent
 ```
 
 `maxConcurrentSubagents` must be a positive safe integer.
+`queueTimeoutMs` must be a positive safe integer; the default is 300000 (five
+minutes), which bounds every pool wait.
 `subagentToolNames` must contain at least one nonempty delegation tool name.
 The bundle patch applies the defaults above; edit the same keys to override
 them.

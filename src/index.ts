@@ -14,11 +14,14 @@ export const name = 'subagent-concurrency-limit'
 export const inject = ['tools']
 
 const DEFAULT_MAX_CONCURRENT_SUBAGENTS = 2
+const DEFAULT_QUEUE_TIMEOUT_MS = 300_000
 
 /** Plugin configuration. */
 export interface Config {
   /** Maximum local non-root turns and observable remote runs at once. */
   maxConcurrentSubagents?: number
+  /** How long a pool wait may stay queued before failing loudly, in milliseconds. */
+  queueTimeoutMs?: number
   /** Delegation tool names whose calls are limited. */
   subagentToolNames?: string[]
 }
@@ -29,6 +32,7 @@ interface Waiter {
   readonly resolve: () => void
   readonly reject: (reason?: unknown) => void
   readonly abort: () => void
+  timeout?: ReturnType<typeof setTimeout>
 }
 
 class ConcurrencyGate {
@@ -41,7 +45,7 @@ class ConcurrencyGate {
     this.limit = limit
   }
 
-  async enter(key: object, signal: AbortSignal): Promise<void> {
+  async enter(key: object, signal: AbortSignal, timeoutMs: number): Promise<void> {
     if (this.active.has(key)) return
     signal.throwIfAborted()
     if (this.closed) throw new Error('subagent concurrency limit is disposed')
@@ -51,6 +55,7 @@ class ConcurrencyGate {
       return
     }
 
+    const timeoutError = new Error(`subagent concurrency limit queue timeout after ${timeoutMs}ms`)
     try {
       await new Promise<void>((resolve, reject) => {
         const waiter: Waiter = {
@@ -61,9 +66,16 @@ class ConcurrencyGate {
           abort: () => {
             const index = this.waiters.indexOf(waiter)
             if (index >= 0) this.waiters.splice(index, 1)
+            this.clearWaiterTimeout(waiter)
             reject(signal.reason)
           },
         }
+        waiter.timeout = setTimeout(() => {
+          const index = this.waiters.indexOf(waiter)
+          if (index >= 0) this.waiters.splice(index, 1)
+          signal.removeEventListener('abort', waiter.abort)
+          reject(timeoutError)
+        }, timeoutMs)
         signal.addEventListener('abort', waiter.abort, { once: true })
         this.waiters.push(waiter)
       })
@@ -97,6 +109,7 @@ class ConcurrencyGate {
     const error = new Error('subagent concurrency limit is disposed')
     for (const waiter of this.waiters.splice(0)) {
       waiter.signal.removeEventListener('abort', waiter.abort)
+      this.clearWaiterTimeout(waiter)
       waiter.reject(error)
     }
   }
@@ -105,8 +118,15 @@ class ConcurrencyGate {
     const waiter = this.waiters.shift()
     if (waiter === undefined) return
     waiter.signal.removeEventListener('abort', waiter.abort)
+    this.clearWaiterTimeout(waiter)
     this.active.add(waiter.key)
     waiter.resolve()
+  }
+
+  private clearWaiterTimeout(waiter: Waiter): void {
+    if (waiter.timeout === undefined) return
+    clearTimeout(waiter.timeout)
+    waiter.timeout = undefined
   }
 }
 
@@ -125,11 +145,16 @@ interface RunState {
 
 function resolveConfig(config: Config): {
   limit: number
+  queueTimeoutMs: number
   subagentToolNames: ReadonlySet<string>
 } {
   const limit = config.maxConcurrentSubagents ?? DEFAULT_MAX_CONCURRENT_SUBAGENTS
   if (!Number.isSafeInteger(limit) || limit < 1) {
     throw new TypeError('maxConcurrentSubagents must be a positive safe integer')
+  }
+  const queueTimeoutMs = config.queueTimeoutMs ?? DEFAULT_QUEUE_TIMEOUT_MS
+  if (!Number.isSafeInteger(queueTimeoutMs) || queueTimeoutMs < 1) {
+    throw new TypeError('queueTimeoutMs must be a positive safe integer')
   }
   const names = config.subagentToolNames ?? ['subagent']
   if (
@@ -139,7 +164,7 @@ function resolveConfig(config: Config): {
   ) {
     throw new TypeError('subagentToolNames must contain at least one non-empty string')
   }
-  return { limit, subagentToolNames: new Set(names) }
+  return { limit, queueTimeoutMs, subagentToolNames: new Set(names) }
 }
 
 /**
@@ -150,11 +175,12 @@ function resolveConfig(config: Config): {
  * for that child. Local child turns use the same pool; root turns do not.
  */
 export function apply(ctx: Context, config: Config = {}): void {
-  const { limit, subagentToolNames } = resolveConfig(config)
+  const { limit, queueTimeoutMs, subagentToolNames } = resolveConfig(config)
   const gate = new ConcurrencyGate(limit)
   const startContext = new AsyncLocalStorage<Reservation>()
   const startsByRunId = new Map<string, RunState>()
   const activeTurnsByAgentId = new Map<string, object>()
+  const pendingByAgentId = new Map<string, Reservation[]>()
 
   function releaseTurn(agentId: string): void {
     const lease = activeTurnsByAgentId.get(agentId)
@@ -176,16 +202,34 @@ export function apply(ctx: Context, config: Config = {}): void {
     const root = delegationDepthOf(exec.agent) === 0
     const reservation: Reservation = { state: 'open' }
     if (root) {
-      await gate.enter(reservation, exec.signal)
+      await gate.enter(reservation, exec.signal, queueTimeoutMs)
     } else if (!gate.tryEnter(reservation, exec.signal)) {
       throw new Error('subagent concurrency limit exhausted for nested delegation')
     }
 
+    let failed = false
     try {
       return await startContext.run(reservation, next)
+    } catch (error) {
+      failed = true
+      throw error
     } finally {
-      if (reservation.state === 'open') gate.release(reservation)
-      reservation.state = 'done'
+      // An error publishes no run, so release. On success keep the reservation
+      // open: a deferred `subagent/start` (jobs publishes after the tool
+      // returns) binds it, and if none ever comes the parent's disposal
+      // releases it below.
+      if (failed && reservation.state === 'open') {
+        gate.release(reservation)
+        reservation.state = 'done'
+      } else if (reservation.state === 'open') {
+        const agentId = String(exec.agent.id)
+        let pending = pendingByAgentId.get(agentId)
+        if (pending === undefined) {
+          pending = []
+          pendingByAgentId.set(agentId, pending)
+        }
+        pending.push(reservation)
+      }
     }
   })
 
@@ -233,10 +277,20 @@ export function apply(ctx: Context, config: Config = {}): void {
     )
     const lease = run?.reservation ?? {}
     try {
-      if (run?.reservation === undefined) await gate.enter(lease, info.signal)
-      else if (!gate.tryEnter(lease, info.signal)) {
+      if (run?.reservation !== undefined) {
         // A locally published child's reservation must remain active until its first turn.
-        throw new Error('subagent concurrency limit reservation was lost')
+        if (!gate.tryEnter(lease, info.signal)) {
+          throw new Error('subagent concurrency limit reservation was lost')
+        }
+      } else if (run !== undefined) {
+        // Published without a reservation (a jobs publish whose async context
+        // lost the tool call's store). Never queue: fail loudly when the pool
+        // is full, so the child cannot block the ancestor waiting for it.
+        if (!gate.tryEnter(lease, info.signal)) {
+          throw new Error('subagent concurrency limit exhausted for reservation-less local child turn')
+        }
+      } else {
+        await gate.enter(lease, info.signal, queueTimeoutMs)
       }
       if (run?.ended) {
         gate.release(lease)
@@ -276,6 +330,15 @@ export function apply(ctx: Context, config: Config = {}): void {
         gate.release(run.reservation)
       }
       startsByRunId.delete(runId)
+    }
+    const pending = pendingByAgentId.get(agentId)
+    if (pending !== undefined) {
+      pendingByAgentId.delete(agentId)
+      for (const reservation of pending) {
+        if (reservation.state !== 'open') continue
+        gate.release(reservation)
+        reservation.state = 'done'
+      }
     }
   })
 }
