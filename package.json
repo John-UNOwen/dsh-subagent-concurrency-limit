@@ -1,6 +1,6 @@
 {
   "name": "dsh-subagent-concurrency-limit",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Limit concurrent DeepSeek Harness subagent turns and delegation runs",
   "license": "MIT",
   "repository": {
