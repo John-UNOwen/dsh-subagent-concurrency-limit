@@ -16,6 +16,9 @@ export const inject = ['tools']
 
 const DEFAULT_MAX_CONCURRENT_SUBAGENTS = 2
 const DEFAULT_QUEUE_TIMEOUT_MS = 300_000
+const DEFAULT_LEND_AFTER_MS = 30_000
+/** Node fires any longer timer after 1 ms, so every wait is clamped to this. */
+const MAX_TIMER_MS = 2_147_483_647
 
 /** A config value as written, or the live reference the Loader passes for a volatile field. */
 export type Live<T> = T | { get(): T }
@@ -30,6 +33,8 @@ export interface Config {
   subagentToolNames?: Live<readonly string[]>
   /** Let only one agent (root included) generate at a time; a parent pauses while its child runs. */
   baton?: Live<boolean>
+  /** In baton mode, how long the holder may sit in tool calls before a non-descendant may borrow the baton. */
+  lendAfterMs?: Live<number>
 }
 
 /** Config schema. Volatile fields show up in dsh settings and on the Plugins page. */
@@ -37,6 +42,11 @@ export const Config = Schema.object({
   baton: Schema.boolean()
     .default(false)
     .description('Only one agent, the root included, generates at a time.')
+    .volatile(),
+  lendAfterMs: Schema.natural()
+    .max(Number.MAX_SAFE_INTEGER)
+    .default(DEFAULT_LEND_AFTER_MS)
+    .description('Baton mode: milliseconds the holder may spend in tools before another agent may borrow the baton.')
     .volatile(),
   maxConcurrentSubagents: Schema.natural()
     .min(1)
@@ -106,12 +116,13 @@ class ConcurrencyGate {
             reject(signal.reason)
           },
         }
+        const delay = Math.min(timeoutMs, MAX_TIMER_MS)
         waiter.timeout = setTimeout(() => {
           const index = this.waiters.indexOf(waiter)
           if (index >= 0) this.waiters.splice(index, 1)
           signal.removeEventListener('abort', waiter.abort)
           reject(timeoutError)
-        }, timeoutMs)
+        }, delay)
         signal.addEventListener('abort', waiter.abort, { once: true })
         this.waiters.push(waiter)
       })
@@ -131,6 +142,12 @@ class ConcurrencyGate {
     if (this.waiters.length > 0 || this.active.size >= this.limit()) return false
     this.active.add(key)
     return true
+  }
+
+  /** Admit over the limit. Baton mode uses it for nested delegation, which cannot add a generator. */
+  forceEnter(key: object): void {
+    if (this.closed) throw new Error('subagent concurrency limit is disposed')
+    this.active.add(key)
   }
 
   release(key: object): void {
@@ -180,9 +197,13 @@ interface BatonWaiter {
  * The owner keeps the baton across its steps until it goes idle, so agents do
  * not interleave on a single-slot server. A delegation hands the baton to the
  * child and suspends the parent; siblings delegated by a suspended parent run
- * before the parent resumes. While the owner is inside a tool call it is not
- * generating, so a waiting agent may borrow the baton; this keeps a parent that
- * waits on an untracked child (for example a workflow agent) from deadlocking.
+ * before the parent resumes.
+ *
+ * While the owner is inside a tool call it is not generating, so a waiting
+ * agent may borrow the baton: a descendant at once (the owner may be waiting on
+ * it, for example a workflow agent, so this avoids deadlock), anyone else only
+ * after the owner has spent `lendAfterMs` in tools. Short tool calls therefore
+ * keep the baton, and the prompt cache, with the agent that made them.
  */
 class Baton {
   private owner: string | undefined
@@ -190,17 +211,27 @@ class Baton {
   private readonly delegated = new Map<string, string[]>()
   private readonly waiters: BatonWaiter[] = []
   private readonly inTools = new Map<string, number>()
+  private readonly toolSince = new Map<string, number>()
+  private readonly depths = new Map<string, number>()
+  private readonly parents = new Map<string, string>()
+  private readonly lendAfterMs: () => number
+  private lendTimer: ReturnType<typeof setTimeout> | undefined
   private closed = false
 
-  async acquire(id: string, signal: AbortSignal): Promise<void> {
+  constructor(lendAfterMs: () => number) {
+    this.lendAfterMs = lendAfterMs
+  }
+
+  async acquire(id: string, signal: AbortSignal, depth: number): Promise<void> {
     signal.throwIfAborted()
     if (this.closed) throw new Error('subagent baton is disposed')
+    this.depths.set(id, depth)
     if (this.owner === id) return
     if (this.owner === undefined) {
       this.owner = id
       return
     }
-    if (this.busyInTools(this.owner) && !this.suspended.includes(id)) {
+    if (this.mayBorrow(id)) {
       this.lendTo(id)
       return
     }
@@ -224,6 +255,7 @@ class Baton {
   /** The parent's delegation published a local child: the baton follows it. */
   handoff(parent: string, child: string): void {
     if (parent === child || this.closed) return
+    this.parents.set(child, parent)
     if (this.owner === parent) {
       this.suspended.push(parent)
       this.owner = child
@@ -239,14 +271,20 @@ class Baton {
   }
 
   toolStart(id: string): void {
-    this.inTools.set(id, (this.inTools.get(id) ?? 0) + 1)
+    const count = this.inTools.get(id) ?? 0
+    if (count === 0) this.toolSince.set(id, Date.now())
+    this.inTools.set(id, count + 1)
     if (this.owner === id) this.settle()
   }
 
   toolEnd(id: string): void {
     const count = (this.inTools.get(id) ?? 0) - 1
-    if (count > 0) this.inTools.set(id, count)
-    else this.inTools.delete(id)
+    if (count > 0) {
+      this.inTools.set(id, count)
+    } else {
+      this.inTools.delete(id)
+      this.toolSince.delete(id)
+    }
   }
 
   /** The agent went idle or its run ended: it no longer needs the baton. */
@@ -265,11 +303,15 @@ class Baton {
       if (index >= 0) queue.splice(index, 1)
     }
     this.inTools.delete(id)
+    this.toolSince.delete(id)
+    this.depths.delete(id)
+    this.parents.delete(id)
     this.release(id)
   }
 
   /** Baton mode was switched: forget ownership and let every waiter through. */
   reset(): void {
+    this.clearLendTimer()
     this.owner = undefined
     this.suspended.length = 0
     this.delegated.clear()
@@ -282,6 +324,7 @@ class Baton {
   close(): void {
     if (this.closed) return
     this.closed = true
+    this.clearLendTimer()
     this.owner = undefined
     const error = new Error('subagent baton is disposed')
     for (const waiter of this.waiters.splice(0)) {
@@ -292,6 +335,51 @@ class Baton {
 
   private busyInTools(id: string): boolean {
     return (this.inTools.get(id) ?? 0) > 0
+  }
+
+  /** Whether `id` descends from `ancestor`: by recorded handoffs, else by depth. */
+  private descendsFrom(id: string, ancestor: string): boolean {
+    let current = id
+    for (let hops = 0; hops < 64; hops++) {
+      const parent = this.parents.get(current)
+      if (parent === ancestor) return true
+      if (parent === undefined) break
+      current = parent
+    }
+    const depth = this.depths.get(current)
+    const ancestorDepth = this.depths.get(ancestor)
+    return depth !== undefined && ancestorDepth !== undefined && depth > ancestorDepth
+  }
+
+  /** How long the current owner has been inside tool calls, or undefined when it is not. */
+  private ownerToolTime(): number | undefined {
+    if (this.owner === undefined || !this.busyInTools(this.owner)) return undefined
+    return Date.now() - (this.toolSince.get(this.owner) ?? Date.now())
+  }
+
+  private mayBorrow(id: string): boolean {
+    const owner = this.owner
+    const toolTime = this.ownerToolTime()
+    if (owner === undefined || toolTime === undefined || id === owner || this.suspended.includes(id)) return false
+    return this.descendsFrom(id, owner) || toolTime >= this.lendAfterMs()
+  }
+
+  private clearLendTimer(): void {
+    if (this.lendTimer === undefined) return
+    clearTimeout(this.lendTimer)
+    this.lendTimer = undefined
+  }
+
+  /** Re-check lending once the owner's tool time reaches lendAfterMs. */
+  private scheduleLend(): void {
+    this.clearLendTimer()
+    const toolTime = this.ownerToolTime()
+    if (this.closed || toolTime === undefined || this.waiters.length === 0) return
+    const delay = Math.min(Math.max(this.lendAfterMs() - toolTime, 0), MAX_TIMER_MS)
+    this.lendTimer = setTimeout(() => {
+      this.lendTimer = undefined
+      this.settle()
+    }, delay)
   }
 
   private lendTo(id: string): void {
@@ -323,11 +411,12 @@ class Baton {
   private settle(): void {
     while (this.owner !== undefined && this.busyInTools(this.owner)) {
       const owner = this.owner
-      const borrower = this.waiters.find((waiter) => waiter.id !== owner && !this.suspended.includes(waiter.id))
+      const borrower = this.waiters.find((waiter) => this.mayBorrow(waiter.id))
       if (borrower === undefined) break
       this.suspended.push(owner)
       this.owner = borrower.id
     }
+    this.scheduleLend()
     for (const waiter of [...this.waiters]) {
       if (waiter.id !== this.owner) continue
       this.waiters.splice(this.waiters.indexOf(waiter), 1)
@@ -355,6 +444,7 @@ interface Settings {
   queueTimeoutMs(): number
   subagentToolNames(): ReadonlySet<string>
   baton(): boolean
+  lendAfterMs(): number
 }
 
 function isPositiveInteger(value: unknown): value is number {
@@ -410,12 +500,19 @@ function resolveConfig(config: Config): Settings {
     (value): value is boolean => typeof value === 'boolean',
     'baton must be a boolean',
   )
+  const lendAfterMs = liveField(
+    config.lendAfterMs,
+    DEFAULT_LEND_AFTER_MS,
+    (value): value is number => Number.isSafeInteger(value) && (value as number) >= 0,
+    'lendAfterMs must be a non-negative safe integer',
+  )
   let namesSource: readonly string[] | undefined
   let namesSet: ReadonlySet<string> = new Set()
   return {
     limit,
     queueTimeoutMs,
     baton,
+    lendAfterMs,
     subagentToolNames() {
       const current = names()
       if (current !== namesSource) {
@@ -456,7 +553,7 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   // The baton tracks tools and releases even while off, so switching it on
   // live starts from correct tool counts; only acquiring and handoff check it.
-  const baton = new Baton()
+  const baton = new Baton(settings.lendAfterMs)
   const toolAgent = new AsyncLocalStorage<string>()
   let batonWasOn = settings.baton()
   function batonOn(): boolean {
@@ -474,7 +571,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     'agent/pre-step',
     async (info, next) => {
       gate.pump()
-      if (batonOn()) await baton.acquire(String(info.agent.id), info.signal)
+      if (batonOn()) await baton.acquire(String(info.agent.id), info.signal, delegationDepthOf(info.agent))
       return next()
     },
     { prepend: true },
@@ -506,7 +603,10 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (root) {
       await gate.enter(reservation, exec.signal, settings.queueTimeoutMs())
     } else if (!gate.tryEnter(reservation, exec.signal)) {
-      throw new Error('subagent concurrency limit exhausted for nested delegation')
+      // With the baton on, a nested child cannot generate alongside anyone,
+      // so it is admitted over the limit instead of failing.
+      if (!batonOn()) throw new Error('subagent concurrency limit exhausted for nested delegation')
+      gate.forceEnter(reservation)
     }
 
     let failed = false

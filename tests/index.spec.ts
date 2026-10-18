@@ -752,22 +752,104 @@ describe('baton', () => {
     finishTurn(ctx, root)
   })
 
-  it('still fails a nested delegation fast when the pool limit is 1', async () => {
+  it('admits a nested delegation over a full pool when the baton is on', async () => {
     const ctx = new Context()
     apply(ctx, { maxConcurrentSubagents: 1, baton: true })
     const root = mockAgent('root')
     const child = mockAgent('child', 1)
+    const grandchild = mockAgent('grandchild', 2)
     const entered: string[] = []
 
     await step(ctx, root, entered)
     await toolCall(ctx, root, 'child-run', entered, { childId: child.id })
     await step(ctx, child, entered)
-    await assert.rejects(toolCall(ctx, child, 'grandchild-run', entered), /exhausted for nested delegation/)
-    // The failed call leaves the baton with the child.
-    await step(ctx, child, entered)
-    assert.deepStrictEqual(entered, ['root', 'child-run', 'child', 'child'])
+    await toolCall(ctx, child, 'grandchild-run', entered, { childId: grandchild.id })
+    const childNext = step(ctx, child, entered)
+    await step(ctx, grandchild, entered)
+    await flush()
+    assert.deepStrictEqual(entered, ['root', 'child-run', 'child', 'grandchild-run', 'grandchild'])
+    finishTurn(ctx, grandchild)
+    endRun(ctx, 'grandchild-run')
+    await childNext
     finishTurn(ctx, child)
     endRun(ctx, 'child-run')
+    finishTurn(ctx, root)
+  })
+
+  it('still fails a nested delegation fast at a full pool with the baton off', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 1 })
+    const root = mockAgent('root')
+    const child = mockAgent('child', 1)
+    const entered: string[] = []
+
+    await toolCall(ctx, root, 'child-run', entered, { childId: child.id })
+    await step(ctx, child, entered)
+    await assert.rejects(toolCall(ctx, child, 'grandchild-run', entered), /exhausted for nested delegation/)
+    finishTurn(ctx, child)
+    endRun(ctx, 'child-run')
+  })
+
+  it('keeps the baton with a sibling through short tool calls', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 4, baton: true, lendAfterMs: 60 })
+    const root = mockAgent('root')
+    const a = mockAgent('a', 1)
+    const b = mockAgent('b', 1)
+    const entered: string[] = []
+
+    await step(ctx, root, entered)
+    await Promise.all([
+      toolCall(ctx, root, 'run-a', entered, { childId: a.id }),
+      toolCall(ctx, root, 'run-b', entered, { childId: b.id }),
+    ])
+    await step(ctx, a, entered)
+    const bStep = step(ctx, b, entered)
+
+    // A short tool call: B must not take the baton, so A's next step follows directly.
+    await runTool(ctx, a, 'pwsh', () => new Promise<void>((resolve) => setTimeout(resolve, 10)))
+    await step(ctx, a, entered)
+    assert.deepStrictEqual(entered.slice(-2), ['a', 'a'])
+    assert.ok(!entered.includes('b'))
+
+    // A long tool call: after lendAfterMs, B borrows the idle slot.
+    let finishTool = () => {}
+    const longTool = runTool(ctx, a, 'pwsh', () => new Promise<void>((resolve) => (finishTool = resolve)))
+    await flush()
+    assert.ok(!entered.includes('b'))
+    await bStep
+    assert.deepStrictEqual(entered.slice(-1), ['b'])
+
+    finishTool()
+    await longTool
+    const aNext = step(ctx, a, entered)
+    await flush()
+    assert.deepStrictEqual(entered.slice(-1), ['b'])
+    finishTurn(ctx, b)
+    await aNext
+    assert.deepStrictEqual(entered.slice(-1), ['a'])
+    finishTurn(ctx, a)
+    endRun(ctx, 'run-a')
+    endRun(ctx, 'run-b')
+    finishTurn(ctx, root)
+  })
+
+  it('lends at once to a waiting descendant even with a long lendAfterMs', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true, lendAfterMs: 3_600_000 })
+    const root = mockAgent('root')
+    const worker = mockAgent('worker', 1)
+    const entered: string[] = []
+
+    await step(ctx, root, entered)
+    const workerStep = step(ctx, worker, entered)
+    let finishTool = () => {}
+    const tool = runTool(ctx, root, 'workflow', () => new Promise<void>((resolve) => (finishTool = resolve)))
+    await workerStep
+    assert.deepStrictEqual(entered, ['root', 'worker'])
+    finishTurn(ctx, worker)
+    finishTool()
+    await tool
     finishTurn(ctx, root)
   })
 
@@ -908,5 +990,26 @@ describe('live settings', () => {
     endRun(ctx, 'first')
     await second
     endRun(ctx, 'second')
+  })
+})
+
+describe('timer limits', () => {
+  it('clamps a queue timeout beyond the Node timer range instead of failing at once', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 1, queueTimeoutMs: 300_000_000_000 })
+    const root = mockAgent('root')
+    const entered: string[] = []
+
+    await toolCall(ctx, root, 'first', entered)
+    let settled = false
+    const queued = toolCall(ctx, root, 'queued', entered).finally(() => {
+      settled = true
+    })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.strictEqual(settled, false)
+    endRun(ctx, 'first')
+    await queued
+    assert.deepStrictEqual(entered, ['first', 'queued'])
+    endRun(ctx, 'queued')
   })
 })

@@ -27,6 +27,7 @@ function loadClient() {
     saving: false,
     failed: false,
     baton: field('true'),
+    lendAfterMs: field('30000'),
     maxConcurrentSubagents: field('4'),
     queueTimeoutMs: field('300000'),
     subagentToolNames: field('subagent'),
@@ -114,7 +115,7 @@ describe('client settings page', () => {
     })
     assert.deepStrictEqual(
       specs.map((spec) => spec.field),
-      ['baton', 'maxConcurrentSubagents', 'queueTimeoutMs', 'subagentToolNames'],
+      ['baton', 'lendAfterMs', 'maxConcurrentSubagents', 'queueTimeoutMs', 'subagentToolNames'],
     )
   })
 
@@ -140,7 +141,12 @@ describe('client settings page', () => {
   it('parses drafts the way the schema accepts them', () => {
     const { loaded } = loadClient()
     type Spec = (field: string) => { format(value: unknown): string; parse(text: string): unknown }
-    const fields = loaded.exports.__fields as { booleanField: Spec; positiveIntegerField: Spec; nameListField: Spec }
+    const fields = loaded.exports.__fields as {
+      booleanField: Spec
+      positiveIntegerField: Spec
+      nonNegativeIntegerField: Spec
+      nameListField: Spec
+    }
     const bool = fields.booleanField('baton')
     assert.deepStrictEqual(plain(bool.parse('true')), { kind: 'set', value: true })
     assert.deepStrictEqual(plain(bool.parse('')), { kind: 'clear' })
@@ -150,6 +156,10 @@ describe('client settings page', () => {
     const int = fields.positiveIntegerField('maxConcurrentSubagents')
     assert.deepStrictEqual(plain(int.parse(' 4 ')), { kind: 'set', value: 4 })
     for (const bad of ['0', '-1', '1.5', 'x', '9007199254740993']) assert.strictEqual(int.parse(bad), undefined)
+
+    const nonNegative = fields.nonNegativeIntegerField('lendAfterMs')
+    assert.deepStrictEqual(plain(nonNegative.parse('0')), { kind: 'set', value: 0 })
+    assert.strictEqual(nonNegative.parse('-1'), undefined)
 
     const names = fields.nameListField('subagentToolNames')
     assert.deepStrictEqual(plain(names.parse('subagent, delegate ,')), { kind: 'set', value: ['subagent', 'delegate'] })

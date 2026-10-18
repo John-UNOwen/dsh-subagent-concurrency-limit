@@ -22,6 +22,10 @@ window.__ModuleLoader__.load({
       batonLabel: 'One agent generates at a time',
       batonHint:
         'For a single-slot local LLM server. A parent pauses while its subagent runs, so agents never interleave and evict the prompt cache.',
+      lendAfter: 'Lend after (ms)',
+      lendAfterHint:
+        'While the baton holder runs a tool, another agent may take the slot only after this long. Its own subagents may at once. Short tool calls keep the prompt cache warm.',
+      invalidNonNegative: 'Enter a whole number of 0 or more.',
       limitsTitle: 'Limits',
       maxConcurrent: 'Maximum concurrent subagents',
       maxConcurrentHint:
@@ -45,6 +49,10 @@ window.__ModuleLoader__.load({
       batonTitle: '接力棒模式',
       batonLabel: '同一时间只有一个代理生成',
       batonHint: '适用于单槽位本地 LLM 服务。子代理运行时父代理暂停，代理不会交错请求而冲掉提示缓存。',
+      lendAfter: '借出等待（毫秒）',
+      lendAfterHint:
+        '持棒代理执行工具时，其他代理需等待这么久才能借用槽位；它自己的子代理可立即借用。短工具调用可保持提示缓存。',
+      invalidNonNegative: '请输入不小于 0 的整数。',
       limitsTitle: '限制',
       maxConcurrent: '最大并发子代理数',
       maxConcurrentHint: '同时存活的子运行和回合数，不含根代理。开启接力棒模式时请保持大于 1，以允许嵌套子代理。',
@@ -76,7 +84,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function positiveIntegerField(field) {
+    function integerField(field, minimum) {
       return {
         field: field,
         format: (value) => (typeof value === 'number' ? String(value) : ''),
@@ -85,9 +93,17 @@ window.__ModuleLoader__.load({
           if (trimmed === '') return { kind: 'clear' }
           if (!/^\d+$/.test(trimmed)) return undefined
           var value = Number(trimmed)
-          return Number.isSafeInteger(value) && value >= 1 ? { kind: 'set', value: value } : undefined
+          return Number.isSafeInteger(value) && value >= minimum ? { kind: 'set', value: value } : undefined
         },
       }
+    }
+
+    function positiveIntegerField(field) {
+      return integerField(field, 1)
+    }
+
+    function nonNegativeIntegerField(field) {
+      return integerField(field, 0)
     }
 
     function nameListField(field) {
@@ -191,6 +207,7 @@ window.__ModuleLoader__.load({
               }),
             ),
             h('p', { style: hint }, t('batonHint')),
+            valueField('lend', 'lendAfterMs', 'lendAfter', 'lendAfterHint', 'invalidNonNegative', true),
             state.baton.overridden
               ? h(
                   'button',
@@ -218,6 +235,7 @@ window.__ModuleLoader__.load({
 
       var form = new ui.SettingsFormModel(ctx.configForms.get(ENTRY_ID), [
         booleanField('baton'),
+        nonNegativeIntegerField('lendAfterMs'),
         positiveIntegerField('maxConcurrentSubagents'),
         positiveIntegerField('queueTimeoutMs'),
         nameListField('subagentToolNames'),
@@ -225,6 +243,7 @@ window.__ModuleLoader__.load({
       var store = form.bind(() =>
         Object.assign(form.shell(), {
           baton: form.field('baton'),
+          lendAfterMs: form.field('lendAfterMs'),
           maxConcurrentSubagents: form.field('maxConcurrentSubagents'),
           queueTimeoutMs: form.field('queueTimeoutMs'),
           subagentToolNames: form.field('subagentToolNames'),
@@ -252,6 +271,7 @@ window.__ModuleLoader__.load({
     module.exports.__fields = {
       booleanField: booleanField,
       positiveIntegerField: positiveIntegerField,
+      nonNegativeIntegerField: nonNegativeIntegerField,
       nameListField: nameListField,
     }
     return module.exports

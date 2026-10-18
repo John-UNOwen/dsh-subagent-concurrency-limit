@@ -66,13 +66,21 @@ a time. Use it with a single-slot local server (for example llama.cpp with
 - Nested subagents work: the deepest active agent runs, and each ancestor
   resumes in turn as its children finish. Paused ancestors never borrow the
   baton from a descendant.
-- While the holder is inside a tool call it is not generating, so a waiting
-  agent may borrow the baton. This prevents a deadlock when a parent waits on
-  a child the plugin cannot link to it (for example a workflow `agent()` call).
+- While the holder is inside a tool call it is not generating, so another
+  agent may borrow the baton:
+  - its own descendants at once, which prevents a deadlock when a parent
+    waits on a child (including one the plugin cannot link to it, such as a
+    workflow `agent()` call);
+  - anyone else only after the holder has spent `lendAfterMs` (default
+    30000) in tools. Short tool calls keep the baton, and the prompt cache,
+    with the agent that made them; a long one lets others use the idle slot.
+    `0` lends on every tool call.
 - Baton waits have no timeout; they end on the turn's abort signal.
-- The pool still limits live runs. Raise `maxConcurrentSubagents` above `1` if
-  nested delegation should be admitted instead of failing fast; the baton
-  still lets only one of them generate.
+- The pool still queues root delegations, but a nested delegation that finds
+  the pool full is admitted over the limit instead of failing: it cannot
+  generate alongside anyone. With the baton off, nested calls still fail fast.
+- Every wait timeout is capped at 2147483647 ms (about 24.8 days), the
+  longest timer Node supports.
 
 ```yaml
 config:
@@ -137,8 +145,8 @@ limit).
 
 Every option is a volatile Config field, so it appears on the web client's
 **Plugins** page: open the bundle **dsh-subagent-concurrency-limit** to get a
-form with the baton switch, the concurrency limit, the queue timeout and the
-delegation tool names. **Save** validates against the plugin's schema and
+form with the baton switch, the lend delay, the concurrency limit, the queue
+timeout and the delegation tool names. **Save** validates against the plugin's schema and
 writes the profile patch.
 
 Changes apply live, without restarting the profile:
@@ -158,6 +166,7 @@ minutes), which bounds every pool wait.
 `subagentToolNames` must contain at least one nonempty delegation tool name.
 `baton` must be a boolean; the code default is `false`, the bundled patch sets
 `true`.
+`lendAfterMs` must be a non-negative safe integer; the default is 30000.
 
 For a single-slot server also start it so requests queue instead of splitting
 the slot, for example llama.cpp with `-np 1`.
