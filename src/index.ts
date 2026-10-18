@@ -24,6 +24,8 @@ export interface Config {
   queueTimeoutMs?: number
   /** Delegation tool names whose calls are limited. */
   subagentToolNames?: string[]
+  /** Let only one agent (root included) generate at a time; a parent pauses while its child runs. */
+  baton?: boolean
 }
 
 interface Waiter {
@@ -130,6 +132,166 @@ class ConcurrencyGate {
   }
 }
 
+interface BatonWaiter {
+  readonly id: string
+  readonly signal: AbortSignal
+  readonly resolve: () => void
+  readonly reject: (reason?: unknown) => void
+  readonly abort: () => void
+}
+
+/**
+ * One global generation permit. Exactly one agent may enter a step at a time.
+ *
+ * The owner keeps the baton across its steps until it goes idle, so agents do
+ * not interleave on a single-slot server. A delegation hands the baton to the
+ * child and suspends the parent; siblings delegated by a suspended parent run
+ * before the parent resumes. While the owner is inside a tool call it is not
+ * generating, so a waiting agent may borrow the baton; this keeps a parent that
+ * waits on an untracked child (for example a workflow agent) from deadlocking.
+ */
+class Baton {
+  private owner: string | undefined
+  private readonly suspended: string[] = []
+  private readonly delegated = new Map<string, string[]>()
+  private readonly waiters: BatonWaiter[] = []
+  private readonly inTools = new Map<string, number>()
+  private closed = false
+
+  async acquire(id: string, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted()
+    if (this.closed) throw new Error('subagent baton is disposed')
+    if (this.owner === id) return
+    if (this.owner === undefined) {
+      this.owner = id
+      return
+    }
+    if (this.busyInTools(this.owner) && !this.suspended.includes(id)) {
+      this.lendTo(id)
+      return
+    }
+    await new Promise<void>((resolve, reject) => {
+      const waiter: BatonWaiter = {
+        id,
+        signal,
+        resolve,
+        reject,
+        abort: () => {
+          const index = this.waiters.indexOf(waiter)
+          if (index >= 0) this.waiters.splice(index, 1)
+          reject(signal.reason)
+        },
+      }
+      signal.addEventListener('abort', waiter.abort, { once: true })
+      this.waiters.push(waiter)
+    })
+  }
+
+  /** The parent's delegation published a local child: the baton follows it. */
+  handoff(parent: string, child: string): void {
+    if (parent === child || this.closed) return
+    if (this.owner === parent) {
+      this.suspended.push(parent)
+      this.owner = child
+      this.settle()
+    } else if (this.suspended.includes(parent)) {
+      let queue = this.delegated.get(parent)
+      if (queue === undefined) {
+        queue = []
+        this.delegated.set(parent, queue)
+      }
+      if (!queue.includes(child)) queue.push(child)
+    }
+  }
+
+  toolStart(id: string): void {
+    this.inTools.set(id, (this.inTools.get(id) ?? 0) + 1)
+    if (this.owner === id) this.settle()
+  }
+
+  toolEnd(id: string): void {
+    const count = (this.inTools.get(id) ?? 0) - 1
+    if (count > 0) this.inTools.set(id, count)
+    else this.inTools.delete(id)
+  }
+
+  /** The agent went idle or its run ended: it no longer needs the baton. */
+  release(id: string): void {
+    const index = this.suspended.indexOf(id)
+    if (index >= 0) this.suspended.splice(index, 1)
+    if (this.owner !== id) return
+    this.owner = undefined
+    this.passOn()
+  }
+
+  disposed(id: string): void {
+    this.delegated.delete(id)
+    for (const queue of this.delegated.values()) {
+      const index = queue.indexOf(id)
+      if (index >= 0) queue.splice(index, 1)
+    }
+    this.inTools.delete(id)
+    this.release(id)
+  }
+
+  close(): void {
+    if (this.closed) return
+    this.closed = true
+    this.owner = undefined
+    const error = new Error('subagent baton is disposed')
+    for (const waiter of this.waiters.splice(0)) {
+      waiter.signal.removeEventListener('abort', waiter.abort)
+      waiter.reject(error)
+    }
+  }
+
+  private busyInTools(id: string): boolean {
+    return (this.inTools.get(id) ?? 0) > 0
+  }
+
+  private lendTo(id: string): void {
+    if (this.owner !== undefined) this.suspended.push(this.owner)
+    this.owner = id
+    this.settle()
+  }
+
+  /** Pick the next owner: delegated siblings, then the parent, then FIFO. */
+  private passOn(): void {
+    const top = this.suspended.at(-1)
+    if (top !== undefined) {
+      const queue = this.delegated.get(top)
+      const child = queue?.shift()
+      if (queue !== undefined && queue.length === 0) this.delegated.delete(top)
+      if (child !== undefined) {
+        this.owner = child
+      } else {
+        this.suspended.pop()
+        this.owner = top
+      }
+    } else {
+      this.owner = this.waiters.find((waiter) => !this.suspended.includes(waiter.id))?.id
+    }
+    this.settle()
+  }
+
+  /** Lend an owner busy in tools, then wake whoever now owns the baton. */
+  private settle(): void {
+    while (this.owner !== undefined && this.busyInTools(this.owner)) {
+      const owner = this.owner
+      const borrower = this.waiters.find((waiter) => waiter.id !== owner && !this.suspended.includes(waiter.id))
+      if (borrower === undefined) break
+      this.suspended.push(owner)
+      this.owner = borrower.id
+    }
+    for (const waiter of [...this.waiters]) {
+      if (waiter.id !== this.owner) continue
+      this.waiters.splice(this.waiters.indexOf(waiter), 1)
+      waiter.signal.removeEventListener('abort', waiter.abort)
+      waiter.resolve()
+    }
+  }
+}
+
 /** A delegation call holding a permit until its child run claims it. */
 interface Reservation {
   state: 'open' | 'bound' | 'done'
@@ -147,6 +309,7 @@ function resolveConfig(config: Config): {
   limit: number
   queueTimeoutMs: number
   subagentToolNames: ReadonlySet<string>
+  baton: boolean
 } {
   const limit = config.maxConcurrentSubagents ?? DEFAULT_MAX_CONCURRENT_SUBAGENTS
   if (!Number.isSafeInteger(limit) || limit < 1) {
@@ -164,7 +327,9 @@ function resolveConfig(config: Config): {
   ) {
     throw new TypeError('subagentToolNames must contain at least one non-empty string')
   }
-  return { limit, queueTimeoutMs, subagentToolNames: new Set(names) }
+  const baton = config.baton ?? false
+  if (typeof baton !== 'boolean') throw new TypeError('baton must be a boolean')
+  return { limit, queueTimeoutMs, subagentToolNames: new Set(names), baton }
 }
 
 /**
@@ -175,7 +340,7 @@ function resolveConfig(config: Config): {
  * for that child. Local child turns use the same pool; root turns do not.
  */
 export function apply(ctx: Context, config: Config = {}): void {
-  const { limit, queueTimeoutMs, subagentToolNames } = resolveConfig(config)
+  const { limit, queueTimeoutMs, subagentToolNames, baton: batonEnabled } = resolveConfig(config)
   const gate = new ConcurrencyGate(limit)
   const startContext = new AsyncLocalStorage<Reservation>()
   const startsByRunId = new Map<string, RunState>()
@@ -193,6 +358,37 @@ export function apply(ctx: Context, config: Config = {}): void {
   }
 
   ctx.effect(() => () => gate.close(), 'subagent concurrency limit')
+
+  const baton = batonEnabled ? new Baton() : undefined
+  const toolAgent = new AsyncLocalStorage<string>()
+  if (baton !== undefined) {
+    ctx.effect(() => () => baton.close(), 'subagent baton')
+
+    // Prepended so no other step or tool listener runs ahead of the baton.
+    ctx.on(
+      'agent/pre-step',
+      async (info, next) => {
+        await baton.acquire(String(info.agent.id), info.signal)
+        return next()
+      },
+      { prepend: true },
+    )
+
+    ctx.on(
+      'tools/execute',
+      async (exec, next) => {
+        if (exec.agent === undefined) return next()
+        const agentId = String(exec.agent.id)
+        baton.toolStart(agentId)
+        try {
+          return await toolAgent.run(agentId, next)
+        } finally {
+          baton.toolEnd(agentId)
+        }
+      },
+      { prepend: true },
+    )
+  }
 
   ctx.on('tools/execute', async (exec, next) => {
     if (!subagentToolNames.has(exec.name) || exec.agent === undefined) {
@@ -241,6 +437,9 @@ export function apply(ctx: Context, config: Config = {}): void {
       ownedReservation = reservation
     }
 
+    const parentId = toolAgent.getStore()
+    if (baton !== undefined && info.local && parentId !== undefined) baton.handoff(parentId, String(info.id))
+
     startsByRunId.set(String(info.runId), {
       agentId: String(info.id),
       local: info.local,
@@ -255,6 +454,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (run === undefined) return
     run.ended = true
     startsByRunId.delete(runId)
+    if (run.local) baton?.release(run.agentId)
     if (run.lease !== undefined) {
       const lease = run.lease
       run.lease = undefined
@@ -313,12 +513,15 @@ export function apply(ctx: Context, config: Config = {}): void {
   })
 
   ctx.on('agent/status', (info) => {
-    if (info.status === 'idle') releaseTurn(String(info.agent.id))
+    if (info.status !== 'idle') return
+    releaseTurn(String(info.agent.id))
+    baton?.release(String(info.agent.id))
   })
 
   ctx.on('agent/disposed', (info) => {
     const agentId = String(info.agent.id)
     releaseTurn(agentId)
+    baton?.disposed(agentId)
     for (const [runId, run] of startsByRunId) {
       if (!run.local || run.agentId !== agentId) continue
       run.ended = true

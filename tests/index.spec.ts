@@ -473,3 +473,177 @@ describe('subagent concurrency limit', () => {
     })
   }
 })
+
+function flush(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve))
+}
+
+function runTool(ctx: Context, agent: Agent, name: string, body: () => Promise<void>): Promise<ToolExecutionResult> {
+  const exec = { name, agent, signal: new AbortController().signal } as ToolDispatchExecution
+  return ctx.waterfall(ctx as never, 'tools/execute', exec, async () => {
+    await body()
+    return { isError: false, value: {}, content: [] }
+  })
+}
+
+describe('baton', () => {
+  it('pauses the parent while its handed-off child runs', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 1, baton: true })
+    const root = mockAgent('root')
+    const child = mockAgent('child', 1)
+    const entered: string[] = []
+
+    await step(ctx, root, entered)
+    await toolCall(ctx, root, 'run', entered, { childId: child.id })
+    const rootNext = step(ctx, root, entered)
+    await flush()
+    await step(ctx, child, entered)
+    await step(ctx, child, entered)
+    assert.deepStrictEqual(entered, ['root', 'run', 'child', 'child'])
+
+    finishTurn(ctx, child)
+    endRun(ctx, 'run')
+    await rootNext
+    assert.deepStrictEqual(entered, ['root', 'run', 'child', 'child', 'root'])
+    finishTurn(ctx, root)
+  })
+
+  it('runs delegated siblings in order before the parent resumes', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 2, baton: true })
+    const root = mockAgent('root')
+    const a = mockAgent('a', 1)
+    const b = mockAgent('b', 1)
+    const entered: string[] = []
+
+    await step(ctx, root, entered)
+    await Promise.all([
+      toolCall(ctx, root, 'run-a', entered, { childId: a.id }),
+      toolCall(ctx, root, 'run-b', entered, { childId: b.id }),
+    ])
+    const rootNext = step(ctx, root, entered)
+    const bStep = step(ctx, b, entered)
+    await flush()
+    await step(ctx, a, entered)
+    assert.deepStrictEqual(entered, ['root', 'run-a', 'run-b', 'a'])
+
+    finishTurn(ctx, a)
+    await bStep
+    await flush()
+    assert.deepStrictEqual(entered, ['root', 'run-a', 'run-b', 'a', 'b'])
+
+    finishTurn(ctx, b)
+    await rootNext
+    assert.deepStrictEqual(entered, ['root', 'run-a', 'run-b', 'a', 'b', 'root'])
+    endRun(ctx, 'run-a')
+    endRun(ctx, 'run-b')
+  })
+
+  it('lets a deeper delegation run first, then unwinds', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 2, baton: true })
+    const root = mockAgent('root')
+    const child = mockAgent('child', 1)
+    const grandchild = mockAgent('grandchild', 2)
+    const entered: string[] = []
+
+    await step(ctx, root, entered)
+    await toolCall(ctx, root, 'child-run', entered, { childId: child.id })
+    const rootNext = step(ctx, root, entered)
+    await step(ctx, child, entered)
+    await toolCall(ctx, child, 'grandchild-run', entered, { childId: grandchild.id })
+    const childNext = step(ctx, child, entered)
+    await flush()
+    await step(ctx, grandchild, entered)
+    assert.deepStrictEqual(entered, ['root', 'child-run', 'child', 'grandchild-run', 'grandchild'])
+
+    finishTurn(ctx, grandchild)
+    endRun(ctx, 'grandchild-run')
+    await childNext
+    await flush()
+    assert.deepStrictEqual(entered.slice(-1), ['child'])
+
+    finishTurn(ctx, child)
+    endRun(ctx, 'child-run')
+    await rootNext
+    assert.deepStrictEqual(entered.slice(-1), ['root'])
+    finishTurn(ctx, root)
+  })
+
+  it('lends the baton while the owner waits inside a tool', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 1, baton: true })
+    const root = mockAgent('root')
+    const worker = mockAgent('worker', 1)
+    const entered: string[] = []
+
+    await step(ctx, root, entered)
+    const workerStep = step(ctx, worker, entered)
+    await flush()
+    assert.deepStrictEqual(entered, ['root'])
+
+    // The root waits in a tool for the untracked worker: the worker borrows the baton.
+    let finishTool = () => {}
+    const tool = runTool(ctx, root, 'wait', () => new Promise<void>((resolve) => (finishTool = resolve)))
+    await workerStep
+    assert.deepStrictEqual(entered, ['root', 'worker'])
+
+    finishTool()
+    await tool
+    const rootNext = step(ctx, root, entered)
+    await flush()
+    assert.deepStrictEqual(entered, ['root', 'worker'])
+
+    finishTurn(ctx, worker)
+    await rootNext
+    assert.deepStrictEqual(entered, ['root', 'worker', 'root'])
+    finishTurn(ctx, root)
+  })
+
+  it('passes the baton to the next waiter when its owner goes idle', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true })
+    const root = mockAgent('root')
+    const mate = mockAgent('mate')
+    const entered: string[] = []
+
+    await step(ctx, root, entered)
+    const mateStep = step(ctx, mate, entered)
+    await flush()
+    assert.deepStrictEqual(entered, ['root'])
+    finishTurn(ctx, root)
+    await mateStep
+    assert.deepStrictEqual(entered, ['root', 'mate'])
+    finishTurn(ctx, mate)
+  })
+
+  it('removes an aborted waiter and returns the baton on disposal', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true })
+    const root = mockAgent('root')
+    const child = mockAgent('child', 1)
+    const other = mockAgent('other', 1)
+    const entered: string[] = []
+    const abort = new AbortController()
+
+    await step(ctx, child, entered)
+    const cancelled = step(ctx, root, entered, abort.signal)
+    await flush()
+    abort.abort(new Error('cancelled while waiting'))
+    await assert.rejects(cancelled, /cancelled while waiting/)
+
+    const otherStep = step(ctx, other, entered)
+    await flush()
+    ctx.emit(ctx as never, 'agent/disposed', { agent: child })
+    await otherStep
+    assert.deepStrictEqual(entered, ['child', 'other'])
+    finishTurn(ctx, other)
+  })
+
+  it('rejects a non-boolean baton option', () => {
+    assert.throws(() => {
+      apply(new Context(), { baton: 'yes' as never })
+    }, /baton must be a boolean/)
+  })
+})

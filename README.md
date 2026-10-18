@@ -48,6 +48,33 @@ one process-local pool. The default limit is `2`.
 - `maxParallelToolCalls` is independent because it limits tool calls, not live
   runs.
 
+## Baton mode (single-slot servers)
+
+With `baton: true`, at most one Agent, the root included, may start a step at
+a time. Use it with a single-slot local server (for example llama.cpp with
+`-np 1`) so agents do not interleave and evict each other's prompt cache.
+
+- The agent holding the baton keeps it across its steps until it goes idle.
+- A delegation that publishes a local child passes the baton to the child and
+  pauses the parent. The parent's next step waits until the child goes idle,
+  its run ends, or it is disposed.
+- Children delegated by a paused parent run one at a time in order, and the
+  parent resumes after the last one. A nested delegation runs before the
+  child that made it continues.
+- While the holder is inside a tool call it is not generating, so a waiting
+  agent may borrow the baton. This prevents a deadlock when a parent waits on
+  a child the plugin cannot link to it (for example a workflow `agent()` call).
+- Baton waits have no timeout; they end on the turn's abort signal.
+- The pool still limits live runs. Raise `maxConcurrentSubagents` above `1` if
+  nested delegation should be admitted instead of failing fast; the baton
+  still lets only one of them generate.
+
+```yaml
+config:
+  baton: true
+  maxConcurrentSubagents: 4
+```
+
 ## Install
 
 These examples use the `web` profile. Replace `web` with your profile name in
@@ -68,6 +95,7 @@ Add the plugin configuration to
   config:
     maxConcurrentSubagents: 2
     queueTimeoutMs: 300000
+    baton: false
     subagentToolNames:
       - subagent
 ```
@@ -76,6 +104,7 @@ Add the plugin configuration to
 `queueTimeoutMs` must be a positive safe integer; the default is 300000 (five
 minutes), which bounds every pool wait.
 `subagentToolNames` must contain at least one nonempty delegation tool name.
+`baton` must be a boolean; the default is `false`.
 The bundle patch applies the defaults above; edit the same keys to override
 them.
 
