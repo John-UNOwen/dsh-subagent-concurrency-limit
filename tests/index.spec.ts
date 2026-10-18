@@ -1013,3 +1013,70 @@ describe('timer limits', () => {
     endRun(ctx, 'queued')
   })
 })
+
+describe('permit leaks seen in a live fan-out', () => {
+  for (const baton of [false, true]) {
+    it(`frees the slot of a child that goes idle before its first step (baton ${baton})`, async () => {
+      const ctx = new Context()
+      apply(ctx, { maxConcurrentSubagents: 1, baton })
+      const root = mockAgent('root')
+      const child = mockAgent('child', 1)
+      const entered: string[] = []
+
+      // The child is published, then aborted while still waiting: it never steps.
+      await toolCall(ctx, root, 'never-stepped', entered, { childId: child.id })
+      status(ctx, child, 'running')
+      finishTurn(ctx, child)
+
+      // A later root delegation must not queue behind the unused slot.
+      let settled = false
+      const next = toolCall(ctx, root, 'next', entered).finally(() => {
+        settled = true
+      })
+      await flush()
+      assert.strictEqual(settled, true)
+      await next
+      assert.deepStrictEqual(entered, ['never-stepped', 'next'])
+      endRun(ctx, 'next')
+    })
+  }
+
+  it('admits a resumed continuable child turn on a full pool with the baton on', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 1, baton: true })
+    const root = mockAgent('root')
+    const child = mockAgent('child', 1)
+    const entered: string[] = []
+
+    await toolCall(ctx, root, 'child-run', entered, { childId: child.id })
+    await step(ctx, child, entered)
+    finishTurn(ctx, child)
+    // Another root delegation now holds the only permit.
+    await toolCall(ctx, root, 'holder', entered)
+
+    // The same run continues with a new message: no new subagent/start.
+    await step(ctx, child, entered)
+    assert.deepStrictEqual(entered, ['child-run', 'child', 'holder', 'child'])
+    finishTurn(ctx, child)
+    endRun(ctx, 'child-run')
+    endRun(ctx, 'holder')
+  })
+
+  it('reports a resumed child turn on a full pool clearly with the baton off', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 1 })
+    const root = mockAgent('root')
+    const child = mockAgent('child', 1)
+    const entered: string[] = []
+
+    await toolCall(ctx, root, 'child-run', entered, { childId: child.id })
+    await step(ctx, child, entered)
+    finishTurn(ctx, child)
+    await toolCall(ctx, root, 'holder', entered)
+    await assert.rejects(step(ctx, child, entered), /exhausted for reservation-less local child turn/)
+    endRun(ctx, 'holder')
+    await step(ctx, child, entered)
+    finishTurn(ctx, child)
+    endRun(ctx, 'child-run')
+  })
+})

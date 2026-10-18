@@ -544,9 +544,21 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (lease === undefined) return
     activeTurnsByAgentId.delete(agentId)
     for (const run of startsByRunId.values()) {
-      if (run.lease === lease) run.lease = undefined
+      if (run.lease !== lease) continue
+      run.lease = undefined
+      // The reservation covered the first turn only; later turns take a fresh permit.
+      if (run.reservation === lease) run.reservation.state = 'done'
     }
     gate.release(lease)
+  }
+
+  /** A child that goes idle before its first step never uses its reservation: free it. */
+  function releaseUnusedReservations(agentId: string): void {
+    for (const run of startsByRunId.values()) {
+      if (run.agentId !== agentId || run.lease !== undefined || run.reservation?.state !== 'bound') continue
+      run.reservation.state = 'done'
+      gate.release(run.reservation)
+    }
   }
 
   ctx.effect(() => () => gate.close(), 'subagent concurrency limit')
@@ -681,17 +693,23 @@ export function apply(ctx: Context, config: Config = {}): void {
     const run = [...startsByRunId.values()].find(
       (candidate) => candidate.local && candidate.agentId === agentId && candidate.lease === undefined,
     )
-    const lease = run?.reservation ?? {}
+    const reserved = run?.reservation?.state === 'bound' ? run.reservation : undefined
+    const lease = reserved ?? {}
     try {
-      if (run?.reservation !== undefined) {
+      if (batonOn()) {
+        // The baton already lets only one agent generate, so a child turn is
+        // never refused or queued here: refusing it fails work for no gain,
+        // and queueing it can deadlock with an ancestor waiting for it.
+        if (!gate.tryEnter(lease, info.signal)) gate.forceEnter(lease)
+      } else if (reserved !== undefined) {
         // A locally published child's reservation must remain active until its first turn.
         if (!gate.tryEnter(lease, info.signal)) {
           throw new Error('subagent concurrency limit reservation was lost')
         }
       } else if (run !== undefined) {
-        // Published without a reservation (a jobs publish whose async context
-        // lost the tool call's store). Never queue: fail loudly when the pool
-        // is full, so the child cannot block the ancestor waiting for it.
+        // A later turn of a run, or a publish whose async context lost the
+        // tool call's store. Never queue: fail loudly when the pool is full,
+        // so the child cannot block the ancestor waiting for it.
         if (!gate.tryEnter(lease, info.signal)) {
           throw new Error('subagent concurrency limit exhausted for reservation-less local child turn')
         }
@@ -721,6 +739,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   ctx.on('agent/status', (info) => {
     if (info.status !== 'idle') return
     releaseTurn(String(info.agent.id))
+    releaseUnusedReservations(String(info.agent.id))
     baton.release(String(info.agent.id))
   })
 

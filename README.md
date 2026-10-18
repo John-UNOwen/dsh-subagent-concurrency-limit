@@ -78,7 +78,10 @@ a time. Use it with a single-slot local server (for example llama.cpp with
 - Baton waits have no timeout; they end on the turn's abort signal.
 - The pool still queues root delegations, but a nested delegation that finds
   the pool full is admitted over the limit instead of failing: it cannot
-  generate alongside anyone. With the baton off, nested calls still fail fast.
+  generate alongside anyone. Child turns are never refused or queued on the
+  pool either. With the baton off, nested calls still fail fast.
+- dsh's own `maxActiveSubagents` (default 8) still applies: idle continuable
+  children count toward it until they are closed.
 - Every wait timeout is capped at 2147483647 ms (about 24.8 days), the
   longest timer Node supports.
 
