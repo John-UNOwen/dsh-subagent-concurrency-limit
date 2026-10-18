@@ -3,6 +3,9 @@
 Limit how many DeepSeek Harness subagent runs and local child-agent turns run at
 the same time in one process. The root Agent is not counted.
 
+This fork adds [baton mode](#baton-mode-single-slot-servers), on by default in
+the bundled patch: only one Agent, the root included, generates at a time.
+
 ## Why it is needed
 
 In [DeepSeek Harness][dsh-repository] `dsh-v0.1.1-rc.2` (commit
@@ -59,8 +62,10 @@ a time. Use it with a single-slot local server (for example llama.cpp with
   pauses the parent. The parent's next step waits until the child goes idle,
   its run ends, or it is disposed.
 - Children delegated by a paused parent run one at a time in order, and the
-  parent resumes after the last one. A nested delegation runs before the
-  child that made it continues.
+  parent resumes after the last one.
+- Nested subagents work: the deepest active agent runs, and each ancestor
+  resumes in turn as its children finish. Paused ancestors never borrow the
+  baton from a descendant.
 - While the holder is inside a tool call it is not generating, so a waiting
   agent may borrow the baton. This prevents a deadlock when a parent waits on
   a child the plugin cannot link to it (for example a workflow `agent()` call).
@@ -75,38 +80,69 @@ config:
   maxConcurrentSubagents: 4
 ```
 
-## Install
+## Install (this fork)
 
-These examples use the `web` profile. Replace `web` with your profile name in
-each command and path.
-
-Install the plugin:
+This fork is not on npm. Push it to your GitHub account and install it from
+there. These examples use the `web` profile; replace `web` with your profile
+name, and `<owner>`/`<commit>` with your fork and the commit to install.
 
 ```sh
-dsh plugin --profile web add dsh-subagent-concurrency-limit
+dsh plugin --profile web add github:<owner>/dsh-subagent-concurrency-limit#<commit>
 ```
 
-Add the plugin configuration to
-`$DSH_HOME/profiles/web/cordis.patch.yml`:
+`lib/` is not committed, so a git install builds it with the package's
+`prepare` script. pnpm 10 and later block that build until it is allowed. If
+the install stops, add the revision-specific key to
+`$DSH_HOME/profiles/web/pnpm-workspace.yaml` (keep existing entries), then rerun
+the install:
+
+```yaml
+allowBuilds:
+  'dsh-subagent-concurrency-limit@https://codeload.github.com/<owner>/dsh-subagent-concurrency-limit/tar.gz/<commit>': true
+```
+
+Check that `dsh-subagent-concurrency-limit` is listed under
+`dsh.profile.bundles` in `$DSH_HOME/profiles/web/package.json`. Only bundles in
+that list load, and the bundle brings its own `cordis.patch.yml`.
+
+### Do I need a profile cordis patch?
+
+No. The fork's bundled patch inserts the plugin with baton mode on:
+
+```yaml
+baton: true
+maxConcurrentSubagents: 4
+subagentToolNames:
+  - subagent
+```
+
+Add an entry to `$DSH_HOME/profiles/web/cordis.patch.yml` only to change these
+values. The profile patch is applied after every bundle layer and targets the
+plugin by id. List the full `config`, because an override may replace the
+bundled config instead of merging with it:
 
 ```yaml
 - id: subagent-concurrency-limit
-  name: dsh-subagent-concurrency-limit
   config:
-    maxConcurrentSubagents: 2
+    baton: true
+    maxConcurrentSubagents: 4
     queueTimeoutMs: 300000
-    baton: false
     subagentToolNames:
       - subagent
 ```
+
+Set `baton: false` to get upstream behaviour (root not counted, only the pool
+limit).
 
 `maxConcurrentSubagents` must be a positive safe integer.
 `queueTimeoutMs` must be a positive safe integer; the default is 300000 (five
 minutes), which bounds every pool wait.
 `subagentToolNames` must contain at least one nonempty delegation tool name.
-`baton` must be a boolean; the default is `false`.
-The bundle patch applies the defaults above; edit the same keys to override
-them.
+`baton` must be a boolean; the code default is `false`, the bundled patch sets
+`true`.
+
+For a single-slot server also start it so requests queue instead of splitting
+the slot, for example llama.cpp with `-np 1`.
 
 Start the profile:
 
@@ -116,11 +152,8 @@ dsh --profile web
 
 ## Update
 
-To update the installed plugin to the latest npm release, run:
-
-```sh
-dsh plugin --profile web add dsh-subagent-concurrency-limit@latest
-```
+Rerun the install command with the new commit hash (and its new
+`allowBuilds` key).
 
 Restart the profile after updating.
 

@@ -486,6 +486,17 @@ function runTool(ctx: Context, agent: Agent, name: string, body: () => Promise<v
   })
 }
 
+/** A foreground delegation: the tool call stays open until `finish` is called. */
+function foregroundCall(ctx: Context, agent: Agent, runId: string, childId: string) {
+  let finish = () => {}
+  const done = new Promise<void>((resolve) => (finish = resolve))
+  const result = runTool(ctx, agent, 'subagent', async () => {
+    ctx.emit(ctx as never, 'subagent/start', { runId, provider: 'spawn', id: childId, local: true })
+    await done
+  })
+  return { result, finish }
+}
+
 describe('baton', () => {
   it('pauses the parent while its handed-off child runs', async () => {
     const ctx = new Context()
@@ -639,6 +650,125 @@ describe('baton', () => {
     await otherStep
     assert.deepStrictEqual(entered, ['child', 'other'])
     finishTurn(ctx, other)
+  })
+
+  it('runs foreground nested delegations depth first and unwinds in order', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 4, baton: true })
+    const root = mockAgent('root')
+    const child = mockAgent('child', 1)
+    const grandchild = mockAgent('grandchild', 2)
+    const entered: string[] = []
+
+    await step(ctx, root, entered)
+    const toChild = foregroundCall(ctx, root, 'child-run', child.id)
+    await flush()
+    await step(ctx, child, entered)
+    const toGrandchild = foregroundCall(ctx, child, 'grandchild-run', grandchild.id)
+    await flush()
+    await step(ctx, grandchild, entered)
+    await step(ctx, grandchild, entered)
+    assert.deepStrictEqual(entered, ['root', 'child', 'grandchild', 'grandchild'])
+
+    finishTurn(ctx, grandchild)
+    endRun(ctx, 'grandchild-run')
+    toGrandchild.finish()
+    await toGrandchild.result
+    await step(ctx, child, entered)
+    finishTurn(ctx, child)
+    endRun(ctx, 'child-run')
+    toChild.finish()
+    await toChild.result
+    await step(ctx, root, entered)
+    assert.deepStrictEqual(entered, ['root', 'child', 'grandchild', 'grandchild', 'child', 'root'])
+    finishTurn(ctx, root)
+  })
+
+  it('keeps ancestors paused while the deepest agent waits in a tool', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 4, baton: true })
+    const root = mockAgent('root')
+    const child = mockAgent('child', 1)
+    const grandchild = mockAgent('grandchild', 2)
+    const entered: string[] = []
+
+    await step(ctx, root, entered)
+    await toolCall(ctx, root, 'child-run', entered, { childId: child.id })
+    await step(ctx, child, entered)
+    await toolCall(ctx, child, 'grandchild-run', entered, { childId: grandchild.id })
+    await step(ctx, grandchild, entered)
+
+    let finishTool = () => {}
+    const tool = runTool(ctx, grandchild, 'bash', () => new Promise<void>((resolve) => (finishTool = resolve)))
+    const rootNext = step(ctx, root, entered)
+    const childNext = step(ctx, child, entered)
+    await flush()
+    // Suspended ancestors never borrow the baton from a descendant.
+    assert.deepStrictEqual(entered, ['root', 'child-run', 'child', 'grandchild-run', 'grandchild'])
+
+    finishTool()
+    await tool
+    await step(ctx, grandchild, entered)
+    finishTurn(ctx, grandchild)
+    endRun(ctx, 'grandchild-run')
+    await childNext
+    await flush()
+    assert.deepStrictEqual(entered.slice(-2), ['grandchild', 'child'])
+    finishTurn(ctx, child)
+    endRun(ctx, 'child-run')
+    await rootNext
+    assert.deepStrictEqual(entered.slice(-1), ['root'])
+    finishTurn(ctx, root)
+  })
+
+  it('runs nested siblings in order before their parent and the root', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 4, baton: true })
+    const root = mockAgent('root')
+    const child = mockAgent('child', 1)
+    const g1 = mockAgent('g1', 2)
+    const g2 = mockAgent('g2', 2)
+    const entered: string[] = []
+
+    await step(ctx, root, entered)
+    await toolCall(ctx, root, 'child-run', entered, { childId: child.id })
+    await step(ctx, child, entered)
+    await Promise.all([
+      toolCall(ctx, child, 'g1-run', entered, { childId: g1.id }),
+      toolCall(ctx, child, 'g2-run', entered, { childId: g2.id }),
+    ])
+    const rootNext = step(ctx, root, entered)
+    const childNext = step(ctx, child, entered)
+    const g2Step = step(ctx, g2, entered)
+    await flush()
+    await step(ctx, g1, entered)
+    finishTurn(ctx, g1)
+    await g2Step
+    finishTurn(ctx, g2)
+    await childNext
+    finishTurn(ctx, child)
+    await rootNext
+    assert.deepStrictEqual(entered, ['root', 'child-run', 'child', 'g1-run', 'g2-run', 'g1', 'g2', 'child', 'root'])
+    finishTurn(ctx, root)
+  })
+
+  it('still fails a nested delegation fast when the pool limit is 1', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 1, baton: true })
+    const root = mockAgent('root')
+    const child = mockAgent('child', 1)
+    const entered: string[] = []
+
+    await step(ctx, root, entered)
+    await toolCall(ctx, root, 'child-run', entered, { childId: child.id })
+    await step(ctx, child, entered)
+    await assert.rejects(toolCall(ctx, child, 'grandchild-run', entered), /exhausted for nested delegation/)
+    // The failed call leaves the baton with the child.
+    await step(ctx, child, entered)
+    assert.deepStrictEqual(entered, ['root', 'child-run', 'child', 'child'])
+    finishTurn(ctx, child)
+    endRun(ctx, 'child-run')
+    finishTurn(ctx, root)
   })
 
   it('rejects a non-boolean baton option', () => {
