@@ -3,7 +3,7 @@ import { describe, it } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import { agentEvents, type Agent, type PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { ToolDispatchExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
-import { apply } from '../src/index.ts'
+import { apply, Config } from '../src/index.ts'
 
 function mockAgent(id: string, subagentDepth = 0): Agent {
   return {
@@ -775,5 +775,138 @@ describe('baton', () => {
     assert.throws(() => {
       apply(new Context(), { baton: 'yes' as never })
     }, /baton must be a boolean/)
+  })
+})
+
+/** A stand-in for the Loader's volatile reference, which dsh settings update in place. */
+function live<T>(value: T): { get(): T; set(next: T): void } {
+  let current = value
+  return {
+    get: () => current,
+    set: (next) => {
+      current = next
+    },
+  }
+}
+
+describe('live settings', () => {
+  it('exports a volatile Config schema with the defaults', () => {
+    const resolved = Config({}) as unknown as Record<string, { get(): unknown }>
+    assert.strictEqual(resolved.baton.get(), false)
+    assert.strictEqual(resolved.maxConcurrentSubagents.get(), 2)
+    assert.strictEqual(resolved.queueTimeoutMs.get(), 300_000)
+    assert.deepStrictEqual(resolved.subagentToolNames.get(), ['subagent'])
+    assert.throws(() => Config({ maxConcurrentSubagents: 0 }))
+    assert.throws(() => Config({ subagentToolNames: [] }))
+  })
+
+  it('runs from a schema-resolved config', async () => {
+    const ctx = new Context()
+    apply(ctx, Config({ baton: true, maxConcurrentSubagents: 1 }) as never)
+    const root = mockAgent('root')
+    const child = mockAgent('child', 1)
+    const entered: string[] = []
+
+    await step(ctx, root, entered)
+    await toolCall(ctx, root, 'run', entered, { childId: child.id })
+    const rootNext = step(ctx, root, entered)
+    await step(ctx, child, entered)
+    await flush()
+    assert.deepStrictEqual(entered, ['root', 'run', 'child'])
+    finishTurn(ctx, child)
+    endRun(ctx, 'run')
+    await rootNext
+    finishTurn(ctx, root)
+  })
+
+  it('admits queued calls when the limit is raised live', async () => {
+    const ctx = new Context()
+    const limit = live(1)
+    apply(ctx, { maxConcurrentSubagents: limit })
+    const root = mockAgent('root')
+    const entered: string[] = []
+
+    await toolCall(ctx, root, 'first', entered)
+    const second = toolCall(ctx, root, 'second', entered)
+    await flush()
+    assert.deepStrictEqual(entered, ['first'])
+
+    limit.set(2)
+    // The next agent activity picks the new limit up.
+    await toolCall(ctx, root, 'other', entered, { name: 'other' })
+    await second
+    assert.deepStrictEqual(entered, ['first', 'other', 'second'])
+    endRun(ctx, 'first')
+    endRun(ctx, 'second')
+  })
+
+  it('releases baton waiters when the baton is switched off live', async () => {
+    const ctx = new Context()
+    const on = live(true)
+    apply(ctx, { baton: on })
+    const root = mockAgent('root')
+    const child = mockAgent('child', 1)
+    const other = mockAgent('other', 1)
+    const entered: string[] = []
+
+    await step(ctx, root, entered)
+    const childStep = step(ctx, child, entered)
+    await flush()
+    assert.deepStrictEqual(entered, ['root'])
+
+    on.set(false)
+    await step(ctx, other, entered)
+    await childStep
+    assert.deepStrictEqual(entered.sort(), ['child', 'other', 'root'])
+
+    // Switched back on, the baton starts fresh.
+    on.set(true)
+    finishTurn(ctx, root)
+    finishTurn(ctx, child)
+    finishTurn(ctx, other)
+    await step(ctx, root, entered)
+    const otherStep = step(ctx, other, entered)
+    await flush()
+    assert.strictEqual(entered.filter((id) => id === 'other').length, 1)
+    finishTurn(ctx, root)
+    await otherStep
+    finishTurn(ctx, other)
+  })
+
+  it('follows delegation tool names edited live', async () => {
+    const ctx = new Context()
+    const names = live<readonly string[]>(['subagent'])
+    apply(ctx, { maxConcurrentSubagents: 1, subagentToolNames: names })
+    const root = mockAgent('root')
+    const entered: string[] = []
+
+    await toolCall(ctx, root, 'a', entered, { name: 'delegate' })
+    await toolCall(ctx, root, 'b', entered, { name: 'delegate' })
+    names.set(['delegate'])
+    const queued = toolCall(ctx, root, 'c', entered, { name: 'delegate' })
+    const blocking = toolCall(ctx, root, 'd', entered, { name: 'delegate' })
+    await flush()
+    assert.deepStrictEqual(entered, ['a', 'b', 'c'])
+    endRun(ctx, 'c')
+    await queued
+    await blocking
+    endRun(ctx, 'd')
+  })
+
+  it('keeps the last valid value when a live value turns invalid', async () => {
+    const ctx = new Context()
+    const limit = live(1)
+    apply(ctx, { maxConcurrentSubagents: limit })
+    const root = mockAgent('root')
+    const entered: string[] = []
+
+    await toolCall(ctx, root, 'first', entered)
+    limit.set(0)
+    const second = toolCall(ctx, root, 'second', entered)
+    await flush()
+    assert.deepStrictEqual(entered, ['first'])
+    endRun(ctx, 'first')
+    await second
+    endRun(ctx, 'second')
   })
 })

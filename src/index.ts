@@ -6,6 +6,7 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks'
 import type { Context } from '@deepseek-ai/cordis'
+import Schema from '@deepseek-ai/schemastery'
 import { delegationDepthOf } from '@deepseek-ai/dsh-subagent'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-tools'
@@ -16,17 +17,45 @@ export const inject = ['tools']
 const DEFAULT_MAX_CONCURRENT_SUBAGENTS = 2
 const DEFAULT_QUEUE_TIMEOUT_MS = 300_000
 
-/** Plugin configuration. */
+/** A config value as written, or the live reference the Loader passes for a volatile field. */
+export type Live<T> = T | { get(): T }
+
+/** Plugin configuration. Every field is volatile: edits apply live, without a restart. */
 export interface Config {
   /** Maximum local non-root turns and observable remote runs at once. */
-  maxConcurrentSubagents?: number
+  maxConcurrentSubagents?: Live<number>
   /** How long a pool wait may stay queued before failing loudly, in milliseconds. */
-  queueTimeoutMs?: number
+  queueTimeoutMs?: Live<number>
   /** Delegation tool names whose calls are limited. */
-  subagentToolNames?: string[]
+  subagentToolNames?: Live<readonly string[]>
   /** Let only one agent (root included) generate at a time; a parent pauses while its child runs. */
-  baton?: boolean
+  baton?: Live<boolean>
 }
+
+/** Config schema. Volatile fields show up in dsh settings and on the Plugins page. */
+export const Config = Schema.object({
+  baton: Schema.boolean()
+    .default(false)
+    .description('Only one agent, the root included, generates at a time.')
+    .volatile(),
+  maxConcurrentSubagents: Schema.natural()
+    .min(1)
+    .max(Number.MAX_SAFE_INTEGER)
+    .default(DEFAULT_MAX_CONCURRENT_SUBAGENTS)
+    .description('Maximum live child runs and turns at once.')
+    .volatile(),
+  queueTimeoutMs: Schema.natural()
+    .min(1)
+    .max(Number.MAX_SAFE_INTEGER)
+    .default(DEFAULT_QUEUE_TIMEOUT_MS)
+    .description('How long a pool wait may stay queued, in milliseconds.')
+    .volatile(),
+  subagentToolNames: Schema.array(Schema.string().min(1))
+    .min(1)
+    .default(['subagent'])
+    .description('Delegation tool names whose calls are limited.')
+    .volatile(),
+})
 
 interface Waiter {
   readonly key: object
@@ -40,11 +69,16 @@ interface Waiter {
 class ConcurrencyGate {
   private readonly active = new Set<object>()
   private readonly waiters: Waiter[] = []
-  private readonly limit: number
+  private readonly limit: () => number
   private closed = false
 
-  constructor(limit: number) {
+  constructor(limit: () => number) {
     this.limit = limit
+  }
+
+  /** Admit waiters a raised limit now has room for. */
+  pump(): void {
+    while (!this.closed && this.waiters.length > 0 && this.active.size < this.limit()) this.admitNext()
   }
 
   async enter(key: object, signal: AbortSignal, timeoutMs: number): Promise<void> {
@@ -52,7 +86,7 @@ class ConcurrencyGate {
     signal.throwIfAborted()
     if (this.closed) throw new Error('subagent concurrency limit is disposed')
 
-    if (this.active.size < this.limit && this.waiters.length === 0) {
+    if (this.active.size < this.limit() && this.waiters.length === 0) {
       this.active.add(key)
       return
     }
@@ -94,7 +128,7 @@ class ConcurrencyGate {
     if (this.active.has(key)) return true
     signal.throwIfAborted()
     if (this.closed) throw new Error('subagent concurrency limit is disposed')
-    if (this.waiters.length > 0 || this.active.size >= this.limit) return false
+    if (this.waiters.length > 0 || this.active.size >= this.limit()) return false
     this.active.add(key)
     return true
   }
@@ -234,6 +268,17 @@ class Baton {
     this.release(id)
   }
 
+  /** Baton mode was switched: forget ownership and let every waiter through. */
+  reset(): void {
+    this.owner = undefined
+    this.suspended.length = 0
+    this.delegated.clear()
+    for (const waiter of this.waiters.splice(0)) {
+      waiter.signal.removeEventListener('abort', waiter.abort)
+      waiter.resolve()
+    }
+  }
+
   close(): void {
     if (this.closed) return
     this.closed = true
@@ -305,31 +350,81 @@ interface RunState {
   ended: boolean
 }
 
-function resolveConfig(config: Config): {
-  limit: number
-  queueTimeoutMs: number
-  subagentToolNames: ReadonlySet<string>
-  baton: boolean
-} {
-  const limit = config.maxConcurrentSubagents ?? DEFAULT_MAX_CONCURRENT_SUBAGENTS
-  if (!Number.isSafeInteger(limit) || limit < 1) {
-    throw new TypeError('maxConcurrentSubagents must be a positive safe integer')
+interface Settings {
+  limit(): number
+  queueTimeoutMs(): number
+  subagentToolNames(): ReadonlySet<string>
+  baton(): boolean
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 1
+}
+
+function isToolNames(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.length > 0 && value.every((name) => typeof name === 'string' && name.length > 0)
+}
+
+/**
+ * Read one field on every use, so edits from dsh settings apply live. The
+ * first read must be valid; a later invalid value keeps the last valid one.
+ */
+function liveField<T>(raw: Live<T> | undefined, fallback: T, valid: (value: unknown) => value is T, error: string) {
+  const read = (): unknown => {
+    const value =
+      typeof raw === 'object' && raw !== null && 'get' in raw && typeof raw.get === 'function' ? raw.get() : raw
+    return value ?? fallback
   }
-  const queueTimeoutMs = config.queueTimeoutMs ?? DEFAULT_QUEUE_TIMEOUT_MS
-  if (!Number.isSafeInteger(queueTimeoutMs) || queueTimeoutMs < 1) {
-    throw new TypeError('queueTimeoutMs must be a positive safe integer')
+  const first = read()
+  if (!valid(first)) throw new TypeError(error)
+  let last: T = first
+  return (): T => {
+    const value = read()
+    if (valid(value)) last = value
+    return last
   }
-  const names = config.subagentToolNames ?? ['subagent']
-  if (
-    !Array.isArray(names) ||
-    names.length === 0 ||
-    names.some((value) => typeof value !== 'string' || value.length === 0)
-  ) {
-    throw new TypeError('subagentToolNames must contain at least one non-empty string')
+}
+
+function resolveConfig(config: Config): Settings {
+  const limit = liveField(
+    config.maxConcurrentSubagents,
+    DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+    isPositiveInteger,
+    'maxConcurrentSubagents must be a positive safe integer',
+  )
+  const queueTimeoutMs = liveField(
+    config.queueTimeoutMs,
+    DEFAULT_QUEUE_TIMEOUT_MS,
+    isPositiveInteger,
+    'queueTimeoutMs must be a positive safe integer',
+  )
+  const names = liveField<readonly string[]>(
+    config.subagentToolNames,
+    ['subagent'],
+    isToolNames,
+    'subagentToolNames must contain at least one non-empty string',
+  )
+  const baton = liveField(
+    config.baton,
+    false,
+    (value): value is boolean => typeof value === 'boolean',
+    'baton must be a boolean',
+  )
+  let namesSource: readonly string[] | undefined
+  let namesSet: ReadonlySet<string> = new Set()
+  return {
+    limit,
+    queueTimeoutMs,
+    baton,
+    subagentToolNames() {
+      const current = names()
+      if (current !== namesSource) {
+        namesSource = current
+        namesSet = new Set(current)
+      }
+      return namesSet
+    },
   }
-  const baton = config.baton ?? false
-  if (typeof baton !== 'boolean') throw new TypeError('baton must be a boolean')
-  return { limit, queueTimeoutMs, subagentToolNames: new Set(names), baton }
 }
 
 /**
@@ -340,8 +435,8 @@ function resolveConfig(config: Config): {
  * for that child. Local child turns use the same pool; root turns do not.
  */
 export function apply(ctx: Context, config: Config = {}): void {
-  const { limit, queueTimeoutMs, subagentToolNames, baton: batonEnabled } = resolveConfig(config)
-  const gate = new ConcurrencyGate(limit)
+  const settings = resolveConfig(config)
+  const gate = new ConcurrencyGate(settings.limit)
   const startContext = new AsyncLocalStorage<Reservation>()
   const startsByRunId = new Map<string, RunState>()
   const activeTurnsByAgentId = new Map<string, object>()
@@ -359,46 +454,57 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   ctx.effect(() => () => gate.close(), 'subagent concurrency limit')
 
-  const baton = batonEnabled ? new Baton() : undefined
+  // The baton tracks tools and releases even while off, so switching it on
+  // live starts from correct tool counts; only acquiring and handoff check it.
+  const baton = new Baton()
   const toolAgent = new AsyncLocalStorage<string>()
-  if (baton !== undefined) {
-    ctx.effect(() => () => baton.close(), 'subagent baton')
-
-    // Prepended so no other step or tool listener runs ahead of the baton.
-    ctx.on(
-      'agent/pre-step',
-      async (info, next) => {
-        await baton.acquire(String(info.agent.id), info.signal)
-        return next()
-      },
-      { prepend: true },
-    )
-
-    ctx.on(
-      'tools/execute',
-      async (exec, next) => {
-        if (exec.agent === undefined) return next()
-        const agentId = String(exec.agent.id)
-        baton.toolStart(agentId)
-        try {
-          return await toolAgent.run(agentId, next)
-        } finally {
-          baton.toolEnd(agentId)
-        }
-      },
-      { prepend: true },
-    )
+  let batonWasOn = settings.baton()
+  function batonOn(): boolean {
+    const on = settings.baton()
+    if (on !== batonWasOn) {
+      batonWasOn = on
+      baton.reset()
+    }
+    return on
   }
+  ctx.effect(() => () => baton.close(), 'subagent baton')
+
+  // Prepended so no other step or tool listener runs ahead of the baton.
+  ctx.on(
+    'agent/pre-step',
+    async (info, next) => {
+      gate.pump()
+      if (batonOn()) await baton.acquire(String(info.agent.id), info.signal)
+      return next()
+    },
+    { prepend: true },
+  )
+
+  ctx.on(
+    'tools/execute',
+    async (exec, next) => {
+      gate.pump()
+      if (exec.agent === undefined) return next()
+      const agentId = String(exec.agent.id)
+      baton.toolStart(agentId)
+      try {
+        return await toolAgent.run(agentId, next)
+      } finally {
+        baton.toolEnd(agentId)
+      }
+    },
+    { prepend: true },
+  )
 
   ctx.on('tools/execute', async (exec, next) => {
-    if (!subagentToolNames.has(exec.name) || exec.agent === undefined) {
+    if (!settings.subagentToolNames().has(exec.name) || exec.agent === undefined) {
       return next()
     }
 
     const root = delegationDepthOf(exec.agent) === 0
     const reservation: Reservation = { state: 'open' }
     if (root) {
-      await gate.enter(reservation, exec.signal, queueTimeoutMs)
+      await gate.enter(reservation, exec.signal, settings.queueTimeoutMs())
     } else if (!gate.tryEnter(reservation, exec.signal)) {
       throw new Error('subagent concurrency limit exhausted for nested delegation')
     }
@@ -438,7 +544,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     }
 
     const parentId = toolAgent.getStore()
-    if (baton !== undefined && info.local && parentId !== undefined) baton.handoff(parentId, String(info.id))
+    if (info.local && parentId !== undefined && batonOn()) baton.handoff(parentId, String(info.id))
 
     startsByRunId.set(String(info.runId), {
       agentId: String(info.id),
@@ -454,7 +560,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (run === undefined) return
     run.ended = true
     startsByRunId.delete(runId)
-    if (run.local) baton?.release(run.agentId)
+    if (run.local) baton.release(run.agentId)
     if (run.lease !== undefined) {
       const lease = run.lease
       run.lease = undefined
@@ -490,7 +596,7 @@ export function apply(ctx: Context, config: Config = {}): void {
           throw new Error('subagent concurrency limit exhausted for reservation-less local child turn')
         }
       } else {
-        await gate.enter(lease, info.signal, queueTimeoutMs)
+        await gate.enter(lease, info.signal, settings.queueTimeoutMs())
       }
       if (run?.ended) {
         gate.release(lease)
@@ -515,13 +621,13 @@ export function apply(ctx: Context, config: Config = {}): void {
   ctx.on('agent/status', (info) => {
     if (info.status !== 'idle') return
     releaseTurn(String(info.agent.id))
-    baton?.release(String(info.agent.id))
+    baton.release(String(info.agent.id))
   })
 
   ctx.on('agent/disposed', (info) => {
     const agentId = String(info.agent.id)
     releaseTurn(agentId)
-    baton?.disposed(agentId)
+    baton.disposed(agentId)
     for (const [runId, run] of startsByRunId) {
       if (!run.local || run.agentId !== agentId) continue
       run.ended = true

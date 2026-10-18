@@ -116,10 +116,9 @@ subagentToolNames:
   - subagent
 ```
 
-Add an entry to `$DSH_HOME/profiles/web/cordis.patch.yml` only to change these
-values. The profile patch is applied after every bundle layer and targets the
-plugin by id. List the full `config`, because an override may replace the
-bundled config instead of merging with it:
+To change a value, use the settings page (below) or edit the profile patch by
+hand. Either way the change lands in `$DSH_HOME/profiles/web/cordis.patch.yml`,
+which is applied after every bundle layer and targets the plugin by id:
 
 ```yaml
 - id: subagent-concurrency-limit
@@ -133,6 +132,25 @@ bundled config instead of merging with it:
 
 Set `baton: false` to get upstream behaviour (root not counted, only the pool
 limit).
+
+### Settings page
+
+Every option is a volatile Config field, so it appears on the web client's
+**Plugins** page: open the bundle **dsh-subagent-concurrency-limit** to get a
+form with the baton switch, the concurrency limit, the queue timeout and the
+delegation tool names. **Save** validates against the plugin's schema and
+writes the profile patch.
+
+Changes apply live, without restarting the profile:
+
+- A raised limit admits queued calls on the next agent activity (a step or a
+  tool call); a lowered one admits no new work until enough has finished.
+- Switching the baton off lets every agent waiting for it continue. Switching
+  it on starts fresh: the next agent to step takes the baton.
+- New delegation tool names count from the next call.
+
+The page needs the web client (`@deepseek-ai/dsh-web-app`); headless profiles
+still read the same fields from the patch.
 
 `maxConcurrentSubagents` must be a positive safe integer.
 `queueTimeoutMs` must be a positive safe integer; the default is 300000 (five
