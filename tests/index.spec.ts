@@ -1080,3 +1080,81 @@ describe('permit leaks seen in a live fan-out', () => {
     endRun(ctx, 'child-run')
   })
 })
+
+/** dsh-user-approval's answerer waterfall: runs before `tools/execute`, around the whole answer. */
+function approval(
+  ctx: Context,
+  agent: Agent,
+  answer: () => Promise<string>,
+  signal = new AbortController().signal,
+): Promise<string> {
+  return ctx.waterfall(ctx as never, 'approval/request' as never, { agent, toolName: 'pwsh', signal } as never, answer)
+}
+
+describe('approvals', () => {
+  it('lets an AI reviewer subagent run while the asking agent waits for it', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true, lendAfterMs: 3_600_000 })
+    const root = mockAgent('root')
+    const reviewer = mockAgent('reviewer', 1)
+    const entered: string[] = []
+
+    await step(ctx, root, entered)
+    // The reviewer is published and runs from inside the approval answerer.
+    const outcome = approval(ctx, root, async () => {
+      startLocalRun(ctx, 'review', reviewer.id)
+      await step(ctx, reviewer, entered)
+      finishTurn(ctx, reviewer)
+      endRun(ctx, 'review')
+      return 'approved'
+    })
+    assert.strictEqual(await outcome, 'approved')
+    await step(ctx, root, entered)
+    assert.deepStrictEqual(entered, ['root', 'reviewer', 'root'])
+    finishTurn(ctx, root)
+  })
+
+  it('lends the baton after lendAfterMs while a human decides, even to a later waiter', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true, lendAfterMs: 40 })
+    const a = mockAgent('a')
+    const b = mockAgent('b')
+    const entered: string[] = []
+
+    await step(ctx, a, entered)
+    let decide = (_outcome: string) => {}
+    const outcome = approval(ctx, a, () => new Promise<string>((resolve) => (decide = resolve)))
+    // B starts waiting only after the approval is already pending.
+    const bStep = step(ctx, b, entered)
+    await flush()
+    assert.deepStrictEqual(entered, ['a'])
+    await bStep
+    assert.deepStrictEqual(entered, ['a', 'b'])
+    decide('approved')
+    await outcome
+    finishTurn(ctx, b)
+    finishTurn(ctx, a)
+  })
+
+  it('stops counting a cancelled approval whose answerer never settles', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true, lendAfterMs: 40 })
+    const a = mockAgent('a')
+    const b = mockAgent('b')
+    const entered: string[] = []
+    const cancel = new AbortController()
+
+    await step(ctx, a, entered)
+    void approval(ctx, a, () => new Promise<string>(() => {}), cancel.signal)
+    cancel.abort()
+    // A generates its next step; B must not borrow mid-generation after lendAfterMs.
+    await step(ctx, a, entered)
+    const bStep = step(ctx, b, entered)
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    assert.deepStrictEqual(entered, ['a', 'a'])
+    finishTurn(ctx, a)
+    await bStep
+    assert.deepStrictEqual(entered, ['a', 'a', 'b'])
+    finishTurn(ctx, b)
+  })
+})

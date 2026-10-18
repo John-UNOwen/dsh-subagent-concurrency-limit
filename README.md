@@ -75,6 +75,9 @@ a time. Use it with a single-slot local server (for example llama.cpp with
     30000) in tools. Short tool calls keep the baton, and the prompt cache,
     with the agent that made them; a long one lets others use the idle slot.
     `0` lends on every tool call.
+  - Waiting for a tool approval counts as tool time too, whether a human or
+    an AI reviewer subagent answers it, so a reviewer can run and others can
+    borrow while you decide.
 - Baton waits have no timeout; they end on the turn's abort signal.
 - The pool still queues root delegations, but a nested delegation that finds
   the pool full is admitted over the limit instead of failing: it cannot

@@ -226,6 +226,10 @@ class Baton {
     signal.throwIfAborted()
     if (this.closed) throw new Error('subagent baton is disposed')
     this.depths.set(id, depth)
+    // A step runs only after the previous step's tool calls settled, so any
+    // tool count left here is a leak; clearing it keeps lending honest.
+    this.inTools.delete(id)
+    this.toolSince.delete(id)
     if (this.owner === id) return
     if (this.owner === undefined) {
       this.owner = id
@@ -249,6 +253,8 @@ class Baton {
       }
       signal.addEventListener('abort', waiter.abort, { once: true })
       this.waiters.push(waiter)
+      // The owner may already be in a tool: start the lend clock for this waiter.
+      this.scheduleLend()
     })
   }
 
@@ -426,6 +432,12 @@ class Baton {
   }
 }
 
+/** The part of dsh-user-approval's `approval/request` payload this plugin reads. */
+interface ApprovalRequest {
+  readonly agent?: { readonly id: unknown }
+  readonly signal?: AbortSignal
+}
+
 /** A delegation call holding a permit until its child run claims it. */
 interface Reservation {
   state: 'open' | 'bound' | 'done'
@@ -589,18 +601,47 @@ export function apply(ctx: Context, config: Config = {}): void {
     { prepend: true },
   )
 
+  /** Count `run` as tool time of `agentId`, so the baton can be lent while it waits. */
+  async function asToolTime<T>(agentId: string, signal: AbortSignal | undefined, run: () => Promise<T>): Promise<T> {
+    let done = false
+    const end = () => {
+      if (done) return
+      done = true
+      signal?.removeEventListener('abort', end)
+      baton.toolEnd(agentId)
+    }
+    baton.toolStart(agentId)
+    // A cancelled approval resolves without waiting for its answerer.
+    signal?.addEventListener('abort', end, { once: true })
+    try {
+      return await toolAgent.run(agentId, run)
+    } finally {
+      end()
+    }
+  }
+
+  // Tool approval is asked before `tools/execute`, so without this an agent
+  // waiting on a human (or on an AI reviewer subagent) would hold the baton
+  // with no tool time: nobody could borrow, and a reviewer would deadlock.
+  // Registered by name because dsh-user-approval is an optional peer.
+  const onApproval = ctx.on as unknown as (
+    name: string,
+    listener: (req: ApprovalRequest, next: () => Promise<unknown>) => Promise<unknown>,
+    options: { prepend: boolean },
+  ) => () => void
+  onApproval.call(
+    ctx,
+    'approval/request',
+    (req, next) => (req?.agent === undefined ? next() : asToolTime(String(req.agent.id), req.signal, next)),
+    { prepend: true },
+  )
+
   ctx.on(
     'tools/execute',
     async (exec, next) => {
       gate.pump()
       if (exec.agent === undefined) return next()
-      const agentId = String(exec.agent.id)
-      baton.toolStart(agentId)
-      try {
-        return await toolAgent.run(agentId, next)
-      } finally {
-        baton.toolEnd(agentId)
-      }
+      return asToolTime(String(exec.agent.id), undefined, next)
     },
     { prepend: true },
   )
