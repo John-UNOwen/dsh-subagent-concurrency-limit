@@ -351,6 +351,7 @@ window.__ModuleLoader__.load({
             { style: hint },
             `${t('catalogError')} `,
             catalog.load ? h('button', { type: 'button', style: link, onClick: catalog.load }, t('refresh')) : null,
+            listing.message ? h('span', { style: { display: 'block' } }, listing.message) : null,
           )
         else if (listing.partial) status = h('p', { style: hint }, t('catalogPartial'))
 
@@ -573,7 +574,7 @@ window.__ModuleLoader__.load({
       ctx.effect(() => () => form.dispose(), 'subagent-concurrency-limit: form subscription')
       var catalog = createCatalog()
       // The model catalog is optional: without it the page keeps the text editor.
-      ctx.inject(['remote.session'], (scope) => {
+      ctx.inject(['remote', 'remote.session'], (scope) => {
         var generation = 0
         catalog.load = () => {
           var mine = ++generation
@@ -592,11 +593,22 @@ window.__ModuleLoader__.load({
                   groups: response.value.groups,
                   partial: response.value.failures.length > 0,
                 })
-              } else catalog.set({ status: 'error', groups: catalog.getSnapshot().groups, partial: false })
+              } else
+                catalog.set({
+                  status: 'error',
+                  groups: catalog.getSnapshot().groups,
+                  partial: false,
+                  message: String(response?.error?.message ?? response?.error ?? ''),
+                })
             })
-            .catch(() => {
+            .catch((error) => {
               if (mine === generation)
-                catalog.set({ status: 'error', groups: catalog.getSnapshot().groups, partial: false })
+                catalog.set({
+                  status: 'error',
+                  groups: catalog.getSnapshot().groups,
+                  partial: false,
+                  message: String(error?.message ?? error),
+                })
             })
         }
         // Already on screen: load now; otherwise the first subscribe loads.

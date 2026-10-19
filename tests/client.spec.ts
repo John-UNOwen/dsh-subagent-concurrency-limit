@@ -99,9 +99,14 @@ function apply(loaded: { exports: Record<string, unknown> }, catalog: unknown = 
     effect: (fn: () => unknown) => fn(),
     inject: (names: string[], fn: (scope: unknown) => void) => {
       if (catalog === undefined || !names.includes('remote.session')) return
+      const remote = { session: { modelCatalog: () => Promise.resolve(catalog) } }
+      // Like cordis: reading a service the scope did not inject throws.
       fn({
         effect: (inner: () => unknown) => inner(),
-        remote: { session: { modelCatalog: () => Promise.resolve(catalog) } },
+        get remote() {
+          if (!names.includes('remote')) throw new Error('cannot get property "remote" without inject')
+          return remote
+        },
       })
     },
     locale: { register: () => () => {} },
