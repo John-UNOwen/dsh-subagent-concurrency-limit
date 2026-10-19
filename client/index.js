@@ -26,6 +26,10 @@ window.__ModuleLoader__.load({
       lendAfterHint:
         'While the baton holder runs a tool, another agent may take the slot only after this long. Its own subagents may at once. Short tool calls keep the prompt cache warm.',
       invalidNonNegative: 'Enter a whole number of 0 or more.',
+      providers: 'Per-provider lanes',
+      providersHint:
+        'Give each listed provider its own baton and limit, e.g. "gpu-a: limit=4; gpu-a-alt: lane=gpu-a; gpu-b: limit=1 lend=60000". Providers on the same server should share a lane. Unlisted providers run freely. Leave empty for one lane covering every agent.',
+      invalidProviders: 'Use "name: lane=NAME baton=on|off limit=N lend=N", separated by semicolons.',
       limitsTitle: 'Limits',
       maxConcurrent: 'Maximum concurrent subagents',
       maxConcurrentHint:
@@ -53,6 +57,10 @@ window.__ModuleLoader__.load({
       lendAfterHint:
         '持棒代理执行工具时，其他代理需等待这么久才能借用槽位；它自己的子代理可立即借用。短工具调用可保持提示缓存。',
       invalidNonNegative: '请输入不小于 0 的整数。',
+      providers: '按提供方分道',
+      providersHint:
+        '为列出的每个提供方单独设置接力棒和上限，例如 "gpu-a: limit=4; gpu-a-alt: lane=gpu-a; gpu-b: limit=1 lend=60000"。同一服务器上的提供方应共用一道。未列出的提供方不受限制。留空则所有代理共用一道。',
+      invalidProviders: '格式为 "名称: lane=道名 baton=on|off limit=N lend=N"，以分号分隔。',
       limitsTitle: '限制',
       maxConcurrent: '最大并发子代理数',
       maxConcurrentHint: '同时存活的子运行和回合数，不含根代理。开启接力棒模式时请保持大于 1，以允许嵌套子代理。',
@@ -104,6 +112,68 @@ window.__ModuleLoader__.load({
 
     function nonNegativeIntegerField(field) {
       return integerField(field, 0)
+    }
+
+    var LANE_KEYS = { lane: 'lane', baton: 'baton', limit: 'maxConcurrentSubagents', lend: 'lendAfterMs' }
+
+    function formatLanes(value) {
+      if (typeof value !== 'object' || value === null) return ''
+      return Object.keys(value)
+        .map((name) => {
+          var lane = value[name] || {}
+          var parts = [`${name}:`]
+          if (typeof lane.lane === 'string') parts.push(`lane=${lane.lane}`)
+          if (typeof lane.baton === 'boolean') parts.push(`baton=${lane.baton ? 'on' : 'off'}`)
+          if (typeof lane.maxConcurrentSubagents === 'number') parts.push(`limit=${lane.maxConcurrentSubagents}`)
+          if (typeof lane.lendAfterMs === 'number') parts.push(`lend=${lane.lendAfterMs}`)
+          return parts.join(' ')
+        })
+        .join('; ')
+    }
+
+    function parseLanes(text) {
+      const lanes = {}
+      const entries = text
+        .split(/[;\n]/)
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0)
+      for (const entry of entries) {
+        const colon = entry.indexOf(':')
+        const name = (colon < 0 ? entry : entry.slice(0, colon)).trim()
+        if (name.length === 0 || Object.hasOwn(lanes, name)) return undefined
+        const lane = {}
+        const rest = colon < 0 ? '' : entry.slice(colon + 1).trim()
+        for (const token of rest.split(/\s+/).filter((part) => part.length > 0)) {
+          const match = /^(lane|baton|limit|lend)=(.+)$/.exec(token)
+          if (match === null) return undefined
+          const key = LANE_KEYS[match[1]]
+          if (key === 'lane') {
+            lane.lane = match[2]
+          } else if (key === 'baton') {
+            if (match[2] !== 'on' && match[2] !== 'off') return undefined
+            lane.baton = match[2] === 'on'
+          } else {
+            if (!/^\d+$/.test(match[2])) return undefined
+            const number = Number(match[2])
+            if (!Number.isSafeInteger(number) || (key === 'maxConcurrentSubagents' && number < 1)) return undefined
+            lane[key] = number
+          }
+        }
+        lanes[name] = lane
+      }
+      return lanes
+    }
+
+    function lanesField(field) {
+      return {
+        field: field,
+        format: formatLanes,
+        parse: (text) => {
+          if (text.trim() === '') return { kind: 'clear' }
+          var lanes = parseLanes(text)
+          return lanes === undefined ? undefined : { kind: 'set', value: lanes }
+        },
+      }
     }
 
     function nameListField(field) {
@@ -223,6 +293,7 @@ window.__ModuleLoader__.load({
             valueField('max', 'maxConcurrentSubagents', 'maxConcurrent', 'maxConcurrentHint', 'invalidInteger', true),
             valueField('timeout', 'queueTimeoutMs', 'queueTimeout', 'queueTimeoutHint', 'invalidInteger', true),
             valueField('tools', 'subagentToolNames', 'toolNames', 'toolNamesHint', 'invalidNames', false),
+            valueField('providers', 'providers', 'providers', 'providersHint', 'invalidProviders', false),
           ),
         )
       }
@@ -239,6 +310,7 @@ window.__ModuleLoader__.load({
         positiveIntegerField('maxConcurrentSubagents'),
         positiveIntegerField('queueTimeoutMs'),
         nameListField('subagentToolNames'),
+        lanesField('providers'),
       ])
       var store = form.bind(() =>
         Object.assign(form.shell(), {
@@ -247,6 +319,7 @@ window.__ModuleLoader__.load({
           maxConcurrentSubagents: form.field('maxConcurrentSubagents'),
           queueTimeoutMs: form.field('queueTimeoutMs'),
           subagentToolNames: form.field('subagentToolNames'),
+          providers: form.field('providers'),
         }),
       )
       ctx.effect(() => () => form.dispose(), 'subagent-concurrency-limit: form subscription')
@@ -273,6 +346,7 @@ window.__ModuleLoader__.load({
       positiveIntegerField: positiveIntegerField,
       nonNegativeIntegerField: nonNegativeIntegerField,
       nameListField: nameListField,
+      lanesField: lanesField,
     }
     return module.exports
   },

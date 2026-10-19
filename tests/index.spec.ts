@@ -1158,3 +1158,197 @@ describe('approvals', () => {
     finishTurn(ctx, b)
   })
 })
+
+function providerAgent(id: string, provider: string, subagentDepth = 0): Agent {
+  return {
+    id,
+    options: { subagentDepth, provider },
+    session: { header: {} },
+    status: 'running',
+  } as unknown as Agent
+}
+
+/** One model step: pre-step, then the request whose route names the provider dsh actually used. */
+async function modelStep(ctx: Context, agent: Agent, entered: string[], provider: string): Promise<void> {
+  await step(ctx, agent, entered, new AbortController().signal, async () => {
+    await agentEvents(ctx, agent).waterfall(
+      'agent/request',
+      { turn: 1, step: 1, signal: new AbortController().signal },
+      () => Promise.resolve({ provider, model: 'm' } as never),
+    )
+    entered.push(String(agent.id))
+    return { kind: 'enter', messages: [] }
+  })
+}
+
+describe('provider lanes', () => {
+  const lanes = { 'local-a': {}, 'local-b': { maxConcurrentSubagents: 1 } }
+
+  it('runs agents on different listed providers in parallel and serializes each provider', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true, providers: lanes })
+    const a1 = providerAgent('a1', 'local-a')
+    const a2 = providerAgent('a2', 'local-a')
+    const b1 = providerAgent('b1', 'local-b')
+    const entered: string[] = []
+
+    await modelStep(ctx, a1, entered, 'local-a')
+    await modelStep(ctx, b1, entered, 'local-b')
+    const a2Step = modelStep(ctx, a2, entered, 'local-a')
+    await flush()
+    assert.deepStrictEqual(entered, ['a1', 'b1'])
+    finishTurn(ctx, a1)
+    await a2Step
+    assert.deepStrictEqual(entered, ['a1', 'b1', 'a2'])
+    finishTurn(ctx, a2)
+    finishTurn(ctx, b1)
+  })
+
+  it('does not limit an unlisted provider', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true, maxConcurrentSubagents: 1, providers: lanes })
+    const local = providerAgent('local', 'local-a')
+    const cloud = providerAgent('cloud', 'deepseek-official')
+    const entered: string[] = []
+
+    await modelStep(ctx, local, entered, 'local-a')
+    await modelStep(ctx, cloud, entered, 'deepseek-official')
+    await modelStep(ctx, cloud, entered, 'deepseek-official')
+    // The cloud root fans out past every limit.
+    await Promise.all(['c1', 'c2', 'c3'].map((run) => toolCall(ctx, cloud, run, entered)))
+    assert.deepStrictEqual(entered, ['local', 'cloud', 'cloud', 'c1', 'c2', 'c3'])
+    finishTurn(ctx, local)
+    finishTurn(ctx, cloud)
+  })
+
+  it('keeps a separate pool limit per provider, following the call arguments', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 1, providers: lanes })
+    const root = providerAgent('root', 'local-a')
+    const entered: string[] = []
+    const call = (runId: string, provider?: string) =>
+      ctx.waterfall(
+        ctx as never,
+        'tools/execute',
+        {
+          name: 'subagent',
+          agent: root,
+          arguments: provider === undefined ? {} : { provider, model: 'm' },
+          signal: new AbortController().signal,
+        } as never,
+        () => {
+          entered.push(runId)
+          ctx.emit(ctx as never, 'subagent/start', { runId, provider: 'spawn', id: `child-${runId}`, local: true })
+          return Promise.resolve({ isError: false, value: {}, content: [] })
+        },
+      )
+
+    await modelStep(ctx, root, entered, 'local-a')
+    await call('a-1')
+    const aQueued = call('a-2')
+    // A different provider in the arguments uses that provider's own pool.
+    await call('b-1', 'local-b')
+    const bQueued = call('b-2', 'local-b')
+    await flush()
+    assert.deepStrictEqual(entered, ['root', 'a-1', 'b-1'])
+    endRun(ctx, 'b-1')
+    await bQueued
+    endRun(ctx, 'a-1')
+    await aQueued
+    assert.deepStrictEqual(entered, ['root', 'a-1', 'b-1', 'b-2', 'a-2'])
+    endRun(ctx, 'a-2')
+    endRun(ctx, 'b-2')
+    finishTurn(ctx, root)
+  })
+
+  it('moves an agent to the lane of the provider its request actually used', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true, providers: lanes })
+    const switcher = providerAgent('switcher', 'local-a')
+    const a = providerAgent('a', 'local-a')
+    const b = providerAgent('b', 'local-b')
+    const entered: string[] = []
+
+    await modelStep(ctx, b, entered, 'local-b')
+    // Guessed local-a at pre-step, but the request goes to local-b: it gives
+    // local-a back and waits for local-b, which b holds.
+    const switched = modelStep(ctx, switcher, entered, 'local-b')
+    await flush()
+    await modelStep(ctx, a, entered, 'local-a')
+    assert.deepStrictEqual(entered, ['b', 'a'])
+    finishTurn(ctx, b)
+    await switched
+    assert.deepStrictEqual(entered, ['b', 'a', 'switcher'])
+    finishTurn(ctx, a)
+    finishTurn(ctx, switcher)
+  })
+
+  it('pauses a parent only for children on its own provider', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true, maxConcurrentSubagents: 4, providers: lanes })
+    const root = providerAgent('root', 'local-a')
+    const same = providerAgent('same', 'local-a', 1)
+    const other = providerAgent('other', 'local-b', 1)
+    const entered: string[] = []
+    const spawn = (runId: string, childId: string, provider?: string) =>
+      ctx.waterfall(
+        ctx as never,
+        'tools/execute',
+        {
+          name: 'subagent',
+          agent: root,
+          arguments: provider === undefined ? {} : { provider, model: 'm' },
+          signal: new AbortController().signal,
+        } as never,
+        () => {
+          ctx.emit(ctx as never, 'subagent/start', { runId, provider: 'spawn', id: childId, local: true })
+          return Promise.resolve({ isError: false, value: {}, content: [] })
+        },
+      )
+
+    await modelStep(ctx, root, entered, 'local-a')
+    // A child on another provider: the parent keeps going.
+    await spawn('other-run', other.id, 'local-b')
+    await modelStep(ctx, root, entered, 'local-a')
+    await modelStep(ctx, other, entered, 'local-b')
+    assert.deepStrictEqual(entered, ['root', 'root', 'other'])
+
+    // A child on its own provider: the parent pauses until it finishes.
+    await spawn('same-run', same.id)
+    const rootNext = modelStep(ctx, root, entered, 'local-a')
+    await modelStep(ctx, same, entered, 'local-a')
+    await flush()
+    assert.deepStrictEqual(entered, ['root', 'root', 'other', 'same'])
+    finishTurn(ctx, same)
+    await rootNext
+    assert.deepStrictEqual(entered.slice(-1), ['root'])
+    finishTurn(ctx, root)
+    finishTurn(ctx, other)
+  })
+
+  it('serializes providers that share a lane', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true, providers: { 'gpu-a': {}, 'gpu-a-alt': { lane: 'gpu-a' }, 'gpu-b': {} } })
+    const one = providerAgent('one', 'gpu-a')
+    const two = providerAgent('two', 'gpu-a-alt')
+    const three = providerAgent('three', 'gpu-b')
+    const entered: string[] = []
+
+    await modelStep(ctx, one, entered, 'gpu-a')
+    const twoStep = modelStep(ctx, two, entered, 'gpu-a-alt')
+    await modelStep(ctx, three, entered, 'gpu-b')
+    await flush()
+    assert.deepStrictEqual(entered, ['one', 'three'])
+    finishTurn(ctx, one)
+    await twoStep
+    assert.deepStrictEqual(entered, ['one', 'three', 'two'])
+    finishTurn(ctx, two)
+    finishTurn(ctx, three)
+  })
+
+  it('rejects a malformed providers map', () => {
+    assert.throws(() => {
+      apply(new Context(), { providers: { 'local-a': { maxConcurrentSubagents: 0 } } })
+    }, /providers must map provider names/)
+  })
+})

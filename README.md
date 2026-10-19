@@ -94,6 +94,42 @@ config:
   maxConcurrentSubagents: 4
 ```
 
+## Per-provider lanes
+
+By default one lane covers every agent: one baton and one pool limit for the
+whole process. If you run several local servers, or mix local and cloud
+models, list the providers that need gating under `providers`. Each listed
+provider gets its own baton and pool, so agents on different providers run in
+parallel, and providers you do not list run without any limit:
+
+```yaml
+config:
+  baton: true             # defaults for listed providers
+  maxConcurrentSubagents: 4
+  providers:
+    my-llamacpp: {}                       # inherits the defaults
+    my-llamacpp-alt: { lane: my-llamacpp } # same server, same baton
+    my-other-gpu: { maxConcurrentSubagents: 2, lendAfterMs: 60000 }
+```
+
+Provider ids that point at the same server must share a lane (`lane:`),
+otherwise they interleave on its single slot. A shared lane takes its
+settings from the first provider listed for it.
+
+- The names are your dsh provider ids (the `provider` in your model routes).
+- An agent's lane is the provider its last model request used. Before its
+  first request, a child is expected to use the provider named in the
+  `subagent` call, or else its parent's.
+- A `subagent` call takes its pool slot in the lane of the provider named in
+  its arguments, or else the parent's.
+- The baton is handed to a child only when parent and child share a lane, so
+  a parent on one GPU keeps working while its child runs on another.
+- An agent that switches model mid-session moves to the new lane at its next
+  request.
+
+On the settings page the map is one line, for example
+`my-llamacpp: limit=4; my-llamacpp-alt: lane=my-llamacpp; my-other-gpu: limit=2 lend=60000`.
+
 ## Install (this fork)
 
 This fork is not on npm. Push it to your GitHub account and install it from

@@ -35,7 +35,31 @@ export interface Config {
   baton?: Live<boolean>
   /** In baton mode, how long the holder may sit in tool calls before a non-descendant may borrow the baton. */
   lendAfterMs?: Live<number>
+  /**
+   * Per-provider lanes. Each listed provider gets its own baton and pool;
+   * unset fields inherit the top-level ones. When empty, one global lane
+   * covers every agent. When not empty, unlisted providers are not limited.
+   */
+  providers?: Live<Readonly<Record<string, ProviderConfig>>>
 }
+
+/** One provider lane's overrides. */
+export interface ProviderConfig {
+  /** Share a lane with other providers that name the same lane (one server, several provider ids). */
+  lane?: string
+  baton?: boolean
+  maxConcurrentSubagents?: number
+  lendAfterMs?: number
+}
+
+const providerLanes: Schema<Record<string, ProviderConfig>> = Schema.dict(
+  Schema.object({
+    lane: Schema.string().min(1),
+    baton: Schema.boolean(),
+    maxConcurrentSubagents: Schema.natural().min(1).max(Number.MAX_SAFE_INTEGER),
+    lendAfterMs: Schema.natural().max(Number.MAX_SAFE_INTEGER),
+  }),
+)
 
 /** Config schema. Volatile fields show up in dsh settings and on the Plugins page. */
 export const Config = Schema.object({
@@ -59,6 +83,12 @@ export const Config = Schema.object({
     .max(Number.MAX_SAFE_INTEGER)
     .default(DEFAULT_QUEUE_TIMEOUT_MS)
     .description('How long a pool wait may stay queued, in milliseconds.')
+    .volatile(),
+  providers: providerLanes
+    .default({})
+    .description(
+      'Per-provider lanes: each listed provider gets its own baton and limit; unlisted providers run freely.',
+    )
     .volatile(),
   subagentToolNames: Schema.array(Schema.string().min(1))
     .min(1)
@@ -441,6 +471,9 @@ interface ApprovalRequest {
 /** A delegation call holding a permit until its child run claims it. */
 interface Reservation {
   state: 'open' | 'bound' | 'done'
+  readonly lane: Lane
+  /** Provider the child is expected to use. */
+  readonly provider: string | undefined
 }
 
 interface RunState {
@@ -457,10 +490,25 @@ interface Settings {
   subagentToolNames(): ReadonlySet<string>
   baton(): boolean
   lendAfterMs(): number
+  providers(): Readonly<Record<string, ProviderConfig>>
 }
 
 function isPositiveInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 1
+}
+
+function isProviderMap(value: unknown): value is Readonly<Record<string, ProviderConfig>> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  return Object.entries(value).every(([name, lane]) => {
+    if (name.length === 0 || typeof lane !== 'object' || lane === null || Array.isArray(lane)) return false
+    const { lane: shared, baton, maxConcurrentSubagents, lendAfterMs } = lane as Record<string, unknown>
+    return (
+      (shared === undefined || (typeof shared === 'string' && shared.length > 0)) &&
+      (baton === undefined || typeof baton === 'boolean') &&
+      (maxConcurrentSubagents === undefined || isPositiveInteger(maxConcurrentSubagents)) &&
+      (lendAfterMs === undefined || (Number.isSafeInteger(lendAfterMs) && (lendAfterMs as number) >= 0))
+    )
+  })
 }
 
 function isToolNames(value: unknown): value is readonly string[] {
@@ -518,6 +566,12 @@ function resolveConfig(config: Config): Settings {
     (value): value is number => Number.isSafeInteger(value) && (value as number) >= 0,
     'lendAfterMs must be a non-negative safe integer',
   )
+  const providers = liveField<Readonly<Record<string, ProviderConfig>>>(
+    config.providers,
+    {},
+    isProviderMap,
+    'providers must map provider names to { baton?, maxConcurrentSubagents?, lendAfterMs? }',
+  )
   let namesSource: readonly string[] | undefined
   let namesSet: ReadonlySet<string> = new Set()
   return {
@@ -525,6 +579,7 @@ function resolveConfig(config: Config): Settings {
     queueTimeoutMs,
     baton,
     lendAfterMs,
+    providers,
     subagentToolNames() {
       const current = names()
       if (current !== namesSource) {
@@ -543,13 +598,103 @@ function resolveConfig(config: Config): Settings {
  * call never waits when the pool is full, because its parent may be waiting
  * for that child. Local child turns use the same pool; root turns do not.
  */
+/** One provider's pool and baton. */
+class Lane {
+  readonly key: string
+  readonly gate: ConcurrencyGate
+  readonly baton: Baton
+  private readonly batonSetting: () => boolean
+  private batonWasOn: boolean
+
+  constructor(key: string, batonSetting: () => boolean, limit: () => number, lendAfterMs: () => number) {
+    this.key = key
+    this.batonSetting = batonSetting
+    this.gate = new ConcurrencyGate(limit)
+    this.baton = new Baton(lendAfterMs)
+    this.batonWasOn = batonSetting()
+  }
+
+  /** Whether this lane's baton is on; a live switch resets it. */
+  batonOn(): boolean {
+    const on = this.batonSetting()
+    if (on !== this.batonWasOn) {
+      this.batonWasOn = on
+      this.baton.reset()
+    }
+    return on
+  }
+
+  close(): void {
+    this.gate.close()
+    this.baton.close()
+  }
+}
+
+/** The key of the single lane used while no providers are listed. */
+const GLOBAL_LANE = '*'
+
 export function apply(ctx: Context, config: Config = {}): void {
   const settings = resolveConfig(config)
-  const gate = new ConcurrencyGate(settings.limit)
+  const lanes = new Map<string, Lane>()
+  /** Gate holding each pool key, so a release reaches the right lane. */
+  const gateOf = new WeakMap<object, ConcurrencyGate>()
+  /** Provider each agent's last model request used. */
+  const observedProvider = new Map<string, string>()
+  /** Provider a published child is expected to use until it makes a request. */
+  const expectedProvider = new Map<string, string>()
+  /** Lane whose baton an agent took for its current step. */
+  const batonLaneOf = new Map<string, Lane>()
+
   const startContext = new AsyncLocalStorage<Reservation>()
   const startsByRunId = new Map<string, RunState>()
   const activeTurnsByAgentId = new Map<string, object>()
   const pendingByAgentId = new Map<string, Reservation[]>()
+  const toolAgent = new AsyncLocalStorage<string>()
+
+  function laneFor(provider: string | undefined): Lane | undefined {
+    const listed = settings.providers()
+    let key: string | undefined = GLOBAL_LANE
+    if (Object.keys(listed).length > 0) {
+      const entry = provider === undefined ? undefined : listed[provider]
+      if (entry === undefined) return undefined
+      key = `lane:${entry.lane ?? provider}`
+    }
+    let lane = lanes.get(key)
+    if (lane === undefined) {
+      const laneKey = key
+      // A shared lane takes its settings from the first provider listed for it.
+      const own = () =>
+        laneKey === GLOBAL_LANE
+          ? undefined
+          : Object.entries(settings.providers()).find(([name, entry]) => `lane:${entry.lane ?? name}` === laneKey)?.[1]
+      lane = new Lane(
+        key,
+        () => own()?.baton ?? settings.baton(),
+        () => own()?.maxConcurrentSubagents ?? settings.limit(),
+        () => own()?.lendAfterMs ?? settings.lendAfterMs(),
+      )
+      lanes.set(key, lane)
+    }
+    return lane
+  }
+
+  function providerOf(agent: { readonly id: unknown; readonly options?: unknown }): string | undefined {
+    const id = String(agent.id)
+    const fromOptions = (agent.options as { provider?: unknown } | undefined)?.provider
+    return (
+      observedProvider.get(id) ??
+      expectedProvider.get(id) ??
+      (typeof fromOptions === 'string' ? fromOptions : undefined)
+    )
+  }
+
+  function enterKey(gate: ConcurrencyGate, key: object): void {
+    gateOf.set(key, gate)
+  }
+
+  function release(key: object): void {
+    gateOf.get(key)?.release(key)
+  }
 
   function releaseTurn(agentId: string): void {
     const lease = activeTurnsByAgentId.get(agentId)
@@ -561,7 +706,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       // The reservation covered the first turn only; later turns take a fresh permit.
       if (run.reservation === lease) run.reservation.state = 'done'
     }
-    gate.release(lease)
+    release(lease)
   }
 
   /** A child that goes idle before its first step never uses its reservation: free it. */
@@ -569,34 +714,65 @@ export function apply(ctx: Context, config: Config = {}): void {
     for (const run of startsByRunId.values()) {
       if (run.agentId !== agentId || run.lease !== undefined || run.reservation?.state !== 'bound') continue
       run.reservation.state = 'done'
-      gate.release(run.reservation)
+      release(run.reservation)
     }
   }
 
-  ctx.effect(() => () => gate.close(), 'subagent concurrency limit')
-
-  // The baton tracks tools and releases even while off, so switching it on
-  // live starts from correct tool counts; only acquiring and handoff check it.
-  const baton = new Baton(settings.lendAfterMs)
-  const toolAgent = new AsyncLocalStorage<string>()
-  let batonWasOn = settings.baton()
-  function batonOn(): boolean {
-    const on = settings.baton()
-    if (on !== batonWasOn) {
-      batonWasOn = on
-      baton.reset()
-    }
-    return on
+  function pumpAll(): void {
+    for (const lane of lanes.values()) lane.gate.pump()
   }
-  ctx.effect(() => () => baton.close(), 'subagent baton')
 
-  // Prepended so no other step or tool listener runs ahead of the baton.
+  ctx.effect(
+    () => () => {
+      for (const lane of lanes.values()) lane.close()
+    },
+    'subagent concurrency lanes',
+  )
+
+  /** Take the baton of `lane` for this agent's step, dropping one held in another lane. */
+  async function takeBaton(agentId: string, depth: number, lane: Lane | undefined, signal: AbortSignal) {
+    const held = batonLaneOf.get(agentId)
+    if (held !== undefined && held !== lane) {
+      held.baton.release(agentId)
+      batonLaneOf.delete(agentId)
+    }
+    if (lane === undefined || !lane.batonOn()) return
+    await lane.baton.acquire(agentId, signal, depth)
+    batonLaneOf.set(agentId, lane)
+  }
+
+  // Prepended so no other step or tool listener runs ahead of the baton. The
+  // lane here is a best guess; `agent/request` corrects it with the real route.
   ctx.on(
     'agent/pre-step',
     async (info, next) => {
-      gate.pump()
-      if (batonOn()) await baton.acquire(String(info.agent.id), info.signal, delegationDepthOf(info.agent))
+      pumpAll()
+      await takeBaton(
+        String(info.agent.id),
+        delegationDepthOf(info.agent),
+        laneFor(providerOf(info.agent)),
+        info.signal,
+      )
       return next()
+    },
+    { prepend: true },
+  )
+
+  ctx.on(
+    'agent/request',
+    async (info, next) => {
+      const call = await next()
+      const agentId = String(info.agent.id)
+      const provider = typeof call?.provider === 'string' ? call.provider : undefined
+      if (provider !== undefined) {
+        observedProvider.set(agentId, provider)
+        expectedProvider.delete(agentId)
+      }
+      const lane = laneFor(provider ?? providerOf(info.agent))
+      if (batonLaneOf.get(agentId) !== lane || (lane?.batonOn() && !batonLaneOf.has(agentId))) {
+        await takeBaton(agentId, delegationDepthOf(info.agent), lane, info.signal)
+      }
+      return call
     },
     { prepend: true },
   )
@@ -604,13 +780,14 @@ export function apply(ctx: Context, config: Config = {}): void {
   /** Count `run` as tool time of `agentId`, so the baton can be lent while it waits. */
   async function asToolTime<T>(agentId: string, signal: AbortSignal | undefined, run: () => Promise<T>): Promise<T> {
     let done = false
+    const counted = [...lanes.values()]
     const end = () => {
       if (done) return
       done = true
       signal?.removeEventListener('abort', end)
-      baton.toolEnd(agentId)
+      for (const lane of counted) lane.baton.toolEnd(agentId)
     }
-    baton.toolStart(agentId)
+    for (const lane of counted) lane.baton.toolStart(agentId)
     // A cancelled approval resolves without waiting for its answerer.
     signal?.addEventListener('abort', end, { once: true })
     try {
@@ -639,7 +816,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   ctx.on(
     'tools/execute',
     async (exec, next) => {
-      gate.pump()
+      pumpAll()
       if (exec.agent === undefined) return next()
       return asToolTime(String(exec.agent.id), undefined, next)
     },
@@ -651,14 +828,21 @@ export function apply(ctx: Context, config: Config = {}): void {
       return next()
     }
 
+    const requested = (exec.arguments as { provider?: unknown } | undefined)?.provider
+    const provider = typeof requested === 'string' && requested.length > 0 ? requested : providerOf(exec.agent)
+    const lane = laneFor(provider)
+    // A provider with no lane is not limited.
+    if (lane === undefined) return next()
+    const gate = lane.gate
     const root = delegationDepthOf(exec.agent) === 0
-    const reservation: Reservation = { state: 'open' }
+    const reservation: Reservation = { state: 'open', lane, provider }
+    enterKey(gate, reservation)
     if (root) {
       await gate.enter(reservation, exec.signal, settings.queueTimeoutMs())
     } else if (!gate.tryEnter(reservation, exec.signal)) {
       // With the baton on, a nested child cannot generate alongside anyone,
       // so it is admitted over the limit instead of failing.
-      if (!batonOn()) throw new Error('subagent concurrency limit exhausted for nested delegation')
+      if (!lane.batonOn()) throw new Error('subagent concurrency limit exhausted for nested delegation')
       gate.forceEnter(reservation)
     }
 
@@ -695,17 +879,30 @@ export function apply(ctx: Context, config: Config = {}): void {
       reservation.state = 'bound'
       ownedReservation = reservation
     }
-
+    const childId = String(info.id)
     const parentId = toolAgent.getStore()
-    if (info.local && parentId !== undefined && batonOn()) baton.handoff(parentId, String(info.id))
+    const expected = reservation?.provider ?? (parentId === undefined ? undefined : observedProvider.get(parentId))
+    if (info.local && expected !== undefined && !observedProvider.has(childId)) expectedProvider.set(childId, expected)
+
+    // The baton follows the child only within one lane: a child on another
+    // provider does not compete with its parent for a slot.
+    const lane = reservation?.lane ?? laneFor(expected)
+    if (info.local && parentId !== undefined && lane?.batonOn()) {
+      if (lane === laneFor(parentId === undefined ? undefined : providerForId(parentId)))
+        lane.baton.handoff(parentId, childId)
+    }
 
     startsByRunId.set(String(info.runId), {
-      agentId: String(info.id),
+      agentId: childId,
       local: info.local,
       reservation: ownedReservation,
       ended: false,
     })
   })
+
+  function providerForId(agentId: string): string | undefined {
+    return observedProvider.get(agentId) ?? expectedProvider.get(agentId)
+  }
 
   ctx.on('subagent/end', (info) => {
     const runId = String(info.runId)
@@ -713,16 +910,17 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (run === undefined) return
     run.ended = true
     startsByRunId.delete(runId)
-    if (run.local) baton.release(run.agentId)
+    if (run.local) for (const lane of lanes.values()) lane.baton.release(run.agentId)
+    if (run.local) batonLaneOf.delete(run.agentId)
     if (run.lease !== undefined) {
       const lease = run.lease
       run.lease = undefined
       if (activeTurnsByAgentId.get(run.agentId) === lease) {
         activeTurnsByAgentId.delete(run.agentId)
       }
-      gate.release(lease)
+      release(lease)
     } else if (run.reservation !== undefined) {
-      gate.release(run.reservation)
+      release(run.reservation)
     }
   })
 
@@ -735,9 +933,14 @@ export function apply(ctx: Context, config: Config = {}): void {
       (candidate) => candidate.local && candidate.agentId === agentId && candidate.lease === undefined,
     )
     const reserved = run?.reservation?.state === 'bound' ? run.reservation : undefined
+    const lane = reserved?.lane ?? laneFor(providerOf(info.agent))
+    // A provider with no lane is not limited.
+    if (lane === undefined) return next()
+    const gate = lane.gate
     const lease = reserved ?? {}
+    enterKey(gate, lease)
     try {
-      if (batonOn()) {
+      if (lane.batonOn()) {
         // The baton already lets only one agent generate, so a child turn is
         // never refused or queued here: refusing it fails work for no gain,
         // and queueing it can deadlock with an ancestor waiting for it.
@@ -779,24 +982,29 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   ctx.on('agent/status', (info) => {
     if (info.status !== 'idle') return
-    releaseTurn(String(info.agent.id))
-    releaseUnusedReservations(String(info.agent.id))
-    baton.release(String(info.agent.id))
+    const agentId = String(info.agent.id)
+    releaseTurn(agentId)
+    releaseUnusedReservations(agentId)
+    for (const lane of lanes.values()) lane.baton.release(agentId)
+    batonLaneOf.delete(agentId)
   })
 
   ctx.on('agent/disposed', (info) => {
     const agentId = String(info.agent.id)
     releaseTurn(agentId)
-    baton.disposed(agentId)
+    for (const lane of lanes.values()) lane.baton.disposed(agentId)
+    batonLaneOf.delete(agentId)
+    observedProvider.delete(agentId)
+    expectedProvider.delete(agentId)
     for (const [runId, run] of startsByRunId) {
       if (!run.local || run.agentId !== agentId) continue
       run.ended = true
       if (run.lease !== undefined) {
         const lease = run.lease
         run.lease = undefined
-        gate.release(lease)
+        release(lease)
       } else if (run.reservation !== undefined) {
-        gate.release(run.reservation)
+        release(run.reservation)
       }
       startsByRunId.delete(runId)
     }
@@ -805,7 +1013,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       pendingByAgentId.delete(agentId)
       for (const reservation of pending) {
         if (reservation.state !== 'open') continue
-        gate.release(reservation)
+        release(reservation)
         reservation.state = 'done'
       }
     }

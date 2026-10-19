@@ -31,6 +31,7 @@ function loadClient() {
     maxConcurrentSubagents: field('4'),
     queueTimeoutMs: field('300000'),
     subagentToolNames: field('subagent'),
+    providers: field(''),
   }
   const ui = {
     SettingsForm: 'SettingsForm',
@@ -115,7 +116,7 @@ describe('client settings page', () => {
     })
     assert.deepStrictEqual(
       specs.map((spec) => spec.field),
-      ['baton', 'lendAfterMs', 'maxConcurrentSubagents', 'queueTimeoutMs', 'subagentToolNames'],
+      ['baton', 'lendAfterMs', 'maxConcurrentSubagents', 'queueTimeoutMs', 'subagentToolNames', 'providers'],
     )
   })
 
@@ -146,6 +147,7 @@ describe('client settings page', () => {
       positiveIntegerField: Spec
       nonNegativeIntegerField: Spec
       nameListField: Spec
+      lanesField: Spec
     }
     const bool = fields.booleanField('baton')
     assert.deepStrictEqual(plain(bool.parse('true')), { kind: 'set', value: true })
@@ -160,6 +162,23 @@ describe('client settings page', () => {
     const nonNegative = fields.nonNegativeIntegerField('lendAfterMs')
     assert.deepStrictEqual(plain(nonNegative.parse('0')), { kind: 'set', value: 0 })
     assert.strictEqual(nonNegative.parse('-1'), undefined)
+
+    const lanes = fields.lanesField('providers')
+    assert.deepStrictEqual(plain(lanes.parse('local-a: baton=on limit=4 lend=60000; local-b: limit=1')), {
+      kind: 'set',
+      value: {
+        'local-a': { baton: true, maxConcurrentSubagents: 4, lendAfterMs: 60000 },
+        'local-b': { maxConcurrentSubagents: 1 },
+      },
+    })
+    assert.deepStrictEqual(plain(lanes.parse('cloud')), { kind: 'set', value: { cloud: {} } })
+    assert.deepStrictEqual(plain(lanes.parse('alt: lane=gpu-a')), { kind: 'set', value: { alt: { lane: 'gpu-a' } } })
+    for (const bad of ['a: limit=0', 'a: baton=yes', 'a: speed=2', 'a; a', ': limit=1'])
+      assert.strictEqual(lanes.parse(bad), undefined)
+    assert.strictEqual(
+      lanes.format({ 'local-a': { baton: false, maxConcurrentSubagents: 2 } }),
+      'local-a: baton=off limit=2',
+    )
 
     const names = fields.nameListField('subagentToolNames')
     assert.deepStrictEqual(plain(names.parse('subagent, delegate ,')), { kind: 'set', value: ['subagent', 'delegate'] })
