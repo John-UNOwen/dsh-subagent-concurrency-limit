@@ -274,9 +274,12 @@ window.__ModuleLoader__.load({
     function createCatalog() {
       var listeners = new Set()
       var snapshot = { status: 'idle', groups: [], partial: false }
-      return {
+      var catalog = {
         subscribe: (listener) => {
           listeners.add(listener)
+          // Load when the page is first shown, like the official pages: at
+          // plugin start the connection may not be up and the call can hang.
+          if (snapshot.status === 'idle' && catalog.load) catalog.load()
           return () => listeners.delete(listener)
         },
         getSnapshot: () => snapshot,
@@ -286,7 +289,10 @@ window.__ModuleLoader__.load({
         },
         load: undefined,
       }
+      return catalog
     }
+
+    var CATALOG_TIMEOUT_MS = 15000
 
     function ProvidersEditor(react, ui, catalog, actions) {
       var h = react.createElement
@@ -332,7 +338,13 @@ window.__ModuleLoader__.load({
         }
 
         var status = null
-        if (listing.status === 'loading') status = h('p', { style: hint }, t('catalogLoading'))
+        if (listing.status === 'loading' || listing.status === 'idle')
+          status = h(
+            'p',
+            { style: hint },
+            `${t('catalogLoading')} `,
+            catalog.load ? h('button', { type: 'button', style: link, onClick: catalog.load }, t('refresh')) : null,
+          )
         else if (listing.status === 'error')
           status = h(
             'p',
@@ -566,7 +578,12 @@ window.__ModuleLoader__.load({
         catalog.load = () => {
           var mine = ++generation
           catalog.set(Object.assign({}, catalog.getSnapshot(), { status: 'loading' }))
-          Promise.resolve(scope.remote.session.modelCatalog())
+          var timer
+          var timeout = new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('model catalog timed out')), CATALOG_TIMEOUT_MS)
+          })
+          Promise.race([Promise.resolve().then(() => scope.remote.session.modelCatalog()), timeout])
+            .finally(() => clearTimeout(timer))
             .then((response) => {
               if (mine !== generation) return
               if (response?.ok) {
@@ -582,7 +599,18 @@ window.__ModuleLoader__.load({
                 catalog.set({ status: 'error', groups: catalog.getSnapshot().groups, partial: false })
             })
         }
-        catalog.load()
+        // Already on screen: load now; otherwise the first subscribe loads.
+        if (catalog.getSnapshot().status !== 'idle') catalog.load()
+        if (typeof scope.on === 'function') {
+          scope.effect(
+            () =>
+              scope.on('connection/reset', () => {
+                catalog.set({ status: 'idle', groups: catalog.getSnapshot().groups, partial: false })
+                catalog.load()
+              }),
+            'subagent-concurrency-limit: catalog after reconnect',
+          )
+        }
         if (typeof scope.remote.$on === 'function') {
           scope.effect(
             () => scope.remote.$on('llm/adapters-updated', () => catalog.load()),

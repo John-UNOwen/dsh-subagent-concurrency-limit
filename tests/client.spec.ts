@@ -55,7 +55,10 @@ function loadClient() {
       props,
       children,
     }),
-    useSyncExternalStore: (_subscribe: unknown, get: () => unknown) => get(),
+    useSyncExternalStore: (subscribe: (listener: () => void) => () => void, get: () => unknown) => {
+      subscribe(() => {})
+      return get()
+    },
   }
   let loaded: { id: string; exports: Record<string, unknown> } | undefined
   const window = {
@@ -68,7 +71,11 @@ function loadClient() {
       },
     },
   }
-  vm.runInNewContext(readFileSync(new URL('../client/index.js', import.meta.url), 'utf8'), { window })
+  vm.runInNewContext(readFileSync(new URL('../client/index.js', import.meta.url), 'utf8'), {
+    window,
+    setTimeout,
+    clearTimeout,
+  })
   assert.ok(loaded)
   return { loaded, specs }
 }
@@ -261,7 +268,11 @@ describe('client provider list', () => {
     }
     const providers = find(form, (el) => typeof el.type === 'function' && el.props?.text !== undefined)
     assert.ok(providers)
-    const rendered = (providers.type as (props: unknown) => unknown)(providers.props)
+    const render = () => (providers.type as (props: unknown) => unknown)(providers.props)
+    // The first render subscribes, which starts the load.
+    render()
+    await new Promise((resolve) => setImmediate(resolve))
+    const rendered = render()
     const text = JSON.stringify(rendered)
     for (const name of ['4090 NInfer', 'Strata', 'DeepSeek']) assert.ok(text.includes(name), name)
     const switches: Element[] = []
@@ -277,5 +288,26 @@ describe('client provider list', () => {
     const { loaded } = loadClient()
     const { registrations } = apply(loaded, undefined)
     assert.strictEqual(registrations.length, 1)
+  })
+})
+
+describe('client catalog loading', () => {
+  it('loads the catalog when the page is shown, not at plugin start', async () => {
+    const { loaded } = loadClient()
+    let calls = 0
+    const { registrations } = apply(loaded, {
+      get ok() {
+        calls++
+        return true
+      },
+      value: CATALOG.value,
+    })
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.strictEqual(calls, 0)
+    const card = registrations[0]?.component
+    assert.ok(card)
+    card({ t: (key: string) => key, view: 'page' })
+    // The card itself does not subscribe to the catalog; only the provider list does.
+    assert.strictEqual(calls, 0)
   })
 })
