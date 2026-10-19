@@ -221,7 +221,7 @@ window.__ModuleLoader__.load({
       var next = {}
       for (var name of Object.keys(map)) {
         if (name === id) continue
-        var entry = Object.assign({}, map[name])
+        const entry = Object.assign({}, map[name])
         if (entry.lane === id) delete entry.lane
         next[name] = entry
       }
