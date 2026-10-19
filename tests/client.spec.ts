@@ -73,11 +73,30 @@ function loadClient() {
   return { loaded, specs }
 }
 
-function apply(loaded: { exports: Record<string, unknown> }) {
+const CATALOG = {
+  ok: true,
+  value: {
+    groups: [
+      { id: 'remote4090-ninfer', name: '4090 NInfer', models: [] },
+      { id: 'strata-llm', name: 'Strata', models: [] },
+      { id: 'deepseek-official', name: 'DeepSeek', models: [] },
+    ],
+    failures: [],
+  },
+}
+
+function apply(loaded: { exports: Record<string, unknown> }, catalog: unknown = CATALOG) {
   const registrations: { options: Record<string, unknown>; component: (props: unknown) => unknown }[] = []
   const namespaces: string[] = []
   const ctx = {
     effect: (fn: () => unknown) => fn(),
+    inject: (names: string[], fn: (scope: unknown) => void) => {
+      if (catalog === undefined || !names.includes('remote.session')) return
+      fn({
+        effect: (inner: () => unknown) => inner(),
+        remote: { session: { modelCatalog: () => Promise.resolve(catalog) } },
+      })
+    },
     locale: { register: () => () => {} },
     configForms: {
       get: (id: string) => {
@@ -185,5 +204,78 @@ describe('client settings page', () => {
     assert.deepStrictEqual(plain(names.parse('  ')), { kind: 'clear' })
     assert.strictEqual(names.parse(' , '), undefined)
     assert.strictEqual(names.format(['a', 'b']), 'a, b')
+  })
+})
+
+describe('client provider list', () => {
+  type Lanes = Record<string, { lane?: string; maxConcurrentSubagents?: number }>
+  function lanes() {
+    const { loaded } = loadClient()
+    return loaded.exports.__lanes as {
+      parseLanes(text: string): Lanes | undefined
+      formatLanes(map: Lanes): string
+      withProvider(map: Lanes, id: string): Lanes
+      withoutProvider(map: Lanes, id: string): Lanes
+      withLane(map: Lanes, id: string, root: string): Lanes
+      withLimit(map: Lanes, id: string, text: string): Lanes | undefined
+    }
+  }
+
+  it('edits the providers map the way the switches and dropdowns do', () => {
+    const l = lanes()
+    let map: Lanes = l.withProvider({}, 'a')
+    map = l.withLane(map, 'b', 'a')
+    map = l.withLimit(map, 'a', '3') as Lanes
+    assert.strictEqual(l.formatLanes(map), 'a: limit=3; b: lane=a')
+    // Pointing the root elsewhere carries its followers along.
+    map = l.withLane(map, 'a', 'c')
+    assert.deepStrictEqual(plain(map), { a: { lane: 'c', maxConcurrentSubagents: 3 }, b: { lane: 'c' }, c: {} })
+    // Switching a root off frees its followers.
+    assert.deepStrictEqual(plain(l.withoutProvider(map, 'c')), { a: { maxConcurrentSubagents: 3 }, b: {} })
+    assert.strictEqual(l.withLimit(map, 'a', '0'), undefined)
+    assert.deepStrictEqual(plain(l.withLimit(map, 'a', '')?.a), { lane: 'c' })
+  })
+
+  it('lists the catalog providers with switches and writes the map on change', async () => {
+    const { loaded } = loadClient()
+    const { registrations } = apply(loaded)
+    await new Promise((resolve) => setImmediate(resolve))
+    const card = registrations[0]?.component
+    assert.ok(card)
+    const t = (key: string) => key
+    const form = card({ t, view: 'page' }) as Element
+    const find = (node: unknown, test: (el: Element) => boolean): Element | undefined => {
+      if (node === null || typeof node !== 'object') return undefined
+      const el = node as Element
+      if (Array.isArray(node))
+        for (const child of node) {
+          const hit = find(child, test)
+          if (hit) return hit
+        }
+      if (el.type !== undefined && test(el)) return el
+      for (const child of el.children ?? []) {
+        const hit = find(child, test)
+        if (hit) return hit
+      }
+      return undefined
+    }
+    const providers = find(form, (el) => typeof el.type === 'function' && el.props?.text !== undefined)
+    assert.ok(providers)
+    const rendered = (providers.type as (props: unknown) => unknown)(providers.props)
+    const text = JSON.stringify(rendered)
+    for (const name of ['4090 NInfer', 'Strata', 'DeepSeek']) assert.ok(text.includes(name), name)
+    const switches: Element[] = []
+    find(rendered, (el) => {
+      if (el.type === 'Switch') switches.push(el)
+      return false
+    })
+    assert.strictEqual(switches.length, 3)
+    assert.ok(switches.every((el) => el.props?.checked === false))
+  })
+
+  it('keeps working without a model catalog', () => {
+    const { loaded } = loadClient()
+    const { registrations } = apply(loaded, undefined)
+    assert.strictEqual(registrations.length, 1)
   })
 })

@@ -127,7 +127,11 @@ settings from the first provider listed for it.
 - An agent that switches model mid-session moves to the new lane at its next
   request.
 
-On the settings page the map is one line, for example
+On the settings page, the **Providers** section lists the providers from your
+model catalog. Switch on the ones that run on a single-slot local server, pick
+**Shares a server with** for provider ids that point at the same server, and
+optionally set a per-provider subagent limit. **Edit as text** shows the same
+map as one line, for example
 `my-llamacpp: limit=4; my-llamacpp-alt: lane=my-llamacpp; my-other-gpu: limit=2 lend=60000`.
 
 ## Install (this fork)

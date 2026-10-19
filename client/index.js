@@ -30,6 +30,20 @@ window.__ModuleLoader__.load({
       providersHint:
         'Give each listed provider its own baton and limit, e.g. "gpu-a: limit=4; gpu-a-alt: lane=gpu-a; gpu-b: limit=1 lend=60000". Providers on the same server should share a lane. Unlisted providers run freely. Leave empty for one lane covering every agent.',
       invalidProviders: 'Use "name: lane=NAME baton=on|off limit=N lend=N", separated by semicolons.',
+      providersTitle: 'Providers',
+      providersIntro:
+        'Switch on each provider that runs on a local server with one slot. It gets its own baton and limit; providers left off run freely. Leave all off for one baton covering every agent.',
+      limitProvider: 'Limit',
+      sharesWith: 'Shares a server with',
+      ownServer: 'Its own server',
+      providerLimit: 'Subagent limit',
+      providerLimitDefault: 'default',
+      notInCatalog: 'not in the current model list',
+      catalogLoading: 'Loading providers…',
+      catalogError: 'Could not load the provider list.',
+      catalogPartial: 'Some providers could not be listed.',
+      refresh: 'Refresh',
+      advanced: 'Edit as text',
       limitsTitle: 'Limits',
       maxConcurrent: 'Maximum concurrent subagents',
       maxConcurrentHint:
@@ -61,6 +75,20 @@ window.__ModuleLoader__.load({
       providersHint:
         '为列出的每个提供方单独设置接力棒和上限，例如 "gpu-a: limit=4; gpu-a-alt: lane=gpu-a; gpu-b: limit=1 lend=60000"。同一服务器上的提供方应共用一道。未列出的提供方不受限制。留空则所有代理共用一道。',
       invalidProviders: '格式为 "名称: lane=道名 baton=on|off limit=N lend=N"，以分号分隔。',
+      providersTitle: '提供方',
+      providersIntro:
+        '为每个运行在单槽位本地服务器上的提供方打开开关，它会获得独立的接力棒和上限；未开启的提供方不受限制。全部关闭则所有代理共用一个接力棒。',
+      limitProvider: '限制',
+      sharesWith: '与之共用服务器',
+      ownServer: '独立服务器',
+      providerLimit: '子代理上限',
+      providerLimitDefault: '默认',
+      notInCatalog: '不在当前模型列表中',
+      catalogLoading: '正在加载提供方…',
+      catalogError: '无法加载提供方列表。',
+      catalogPartial: '部分提供方无法列出。',
+      refresh: '刷新',
+      advanced: '以文本编辑',
       limitsTitle: '限制',
       maxConcurrent: '最大并发子代理数',
       maxConcurrentHint: '同时存活的子运行和回合数，不含根代理。开启接力棒模式时请保持大于 1，以允许嵌套子代理。',
@@ -176,6 +204,58 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** The lane root a provider's baton belongs to. */
+    function laneRoot(map, id) {
+      var entry = map[id]
+      return entry && typeof entry.lane === 'string' && entry.lane !== id ? entry.lane : id
+    }
+
+    function withProvider(map, id) {
+      var next = Object.assign({}, map)
+      if (!Object.hasOwn(next, id)) next[id] = {}
+      return next
+    }
+
+    /** Turn a provider off; providers that shared its server get their own lane. */
+    function withoutProvider(map, id) {
+      var next = {}
+      for (var name of Object.keys(map)) {
+        if (name === id) continue
+        var entry = Object.assign({}, map[name])
+        if (entry.lane === id) delete entry.lane
+        next[name] = entry
+      }
+      return next
+    }
+
+    /** Point a provider at another provider's server, or back to its own (`root` empty). */
+    function withLane(map, id, root) {
+      var next = withProvider(map, id)
+      var entry = Object.assign({}, next[id])
+      if (root === '' || root === id) delete entry.lane
+      else {
+        entry.lane = root
+        next = withProvider(next, root)
+        // Providers that shared this one's server now follow the new root.
+        for (var name of Object.keys(next)) {
+          if (name !== id && next[name].lane === id) next[name] = Object.assign({}, next[name], { lane: root })
+        }
+      }
+      next[id] = entry
+      return next
+    }
+
+    function withLimit(map, id, text) {
+      var next = withProvider(map, id)
+      var entry = Object.assign({}, next[id])
+      var trimmed = text.trim()
+      if (trimmed === '') delete entry.maxConcurrentSubagents
+      else if (/^\d+$/.test(trimmed) && Number(trimmed) >= 1) entry.maxConcurrentSubagents = Number(trimmed)
+      else return undefined
+      next[id] = entry
+      return next
+    }
+
     function nameListField(field) {
       return {
         field: field,
@@ -191,7 +271,152 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function createCard(react, ui, store, actions) {
+    function createCatalog() {
+      var listeners = new Set()
+      var snapshot = { status: 'idle', groups: [], partial: false }
+      return {
+        subscribe: (listener) => {
+          listeners.add(listener)
+          return () => listeners.delete(listener)
+        },
+        getSnapshot: () => snapshot,
+        set: (next) => {
+          snapshot = next
+          for (var listener of listeners) listener()
+        },
+        load: undefined,
+      }
+    }
+
+    function ProvidersEditor(react, ui, catalog, actions) {
+      var h = react.createElement
+      var hint = { margin: 0, fontSize: '12px', lineHeight: 1.5, color: 'var(--dsw-alias-label-tertiary)' }
+      var row = {
+        display: 'grid',
+        gridTemplateColumns: 'minmax(0,1fr) auto',
+        gap: '8px 16px',
+        alignItems: 'center',
+        padding: '10px 0',
+        borderTop: '0.5px solid var(--dsw-alias-border-l3)',
+      }
+      var details = { gridColumn: '1 / -1', display: 'flex', flexWrap: 'wrap', gap: '12px', fontSize: '12px' }
+      var control = {
+        font: 'inherit',
+        fontSize: '12px',
+        padding: '4px 6px',
+        borderRadius: 'var(--dsw-radius-md)',
+        border: '0.5px solid var(--dsw-alias-border-l4)',
+        background: 'transparent',
+        color: 'var(--dsw-alias-label-primary)',
+      }
+      var link = {
+        background: 'none',
+        border: 0,
+        padding: 0,
+        cursor: 'pointer',
+        fontSize: '12px',
+        color: 'var(--dsw-alias-brand-primary)',
+      }
+
+      return function Providers(props) {
+        var t = props.t
+        var listing = react.useSyncExternalStore(catalog.subscribe, catalog.getSnapshot)
+        var map = props.text.trim() === '' ? {} : parseLanes(props.text)
+        if (map === undefined) return null
+        var names = new Map()
+        for (var group of listing.groups) names.set(group.id, group.name || group.id)
+        var ids = [...names.keys()]
+        for (var id of Object.keys(map)) if (!names.has(id)) ids.push(id)
+        var write = (next) => {
+          if (next !== undefined) actions.edit('providers', formatLanes(next))
+        }
+
+        var status = null
+        if (listing.status === 'loading') status = h('p', { style: hint }, t('catalogLoading'))
+        else if (listing.status === 'error')
+          status = h(
+            'p',
+            { style: hint },
+            `${t('catalogError')} `,
+            catalog.load ? h('button', { type: 'button', style: link, onClick: catalog.load }, t('refresh')) : null,
+          )
+        else if (listing.partial) status = h('p', { style: hint }, t('catalogPartial'))
+
+        return h(
+          'div',
+          null,
+          h('p', { style: hint }, t('providersIntro')),
+          status,
+          ids.map((id) => {
+            var on = Object.hasOwn(map, id)
+            var entry = map[id] || {}
+            var roots = ids.filter(
+              (other) => other !== id && Object.hasOwn(map, other) && laneRoot(map, other) === other,
+            )
+            var label = names.has(id) ? names.get(id) : `${id} (${t('notInCatalog')})`
+            return h(
+              'div',
+              { key: id, style: row },
+              h(
+                'div',
+                { style: { minWidth: 0 } },
+                h('div', { style: { fontSize: '13px', color: 'var(--dsw-alias-label-primary)' } }, label),
+                label !== id ? h('div', { style: hint }, id) : null,
+              ),
+              h(ui.Switch, {
+                checked: on,
+                label: `${t('limitProvider')} ${label}`,
+                disabled: props.disabled,
+                onChange: (next) => write(next ? withProvider(map, id) : withoutProvider(map, id)),
+              }),
+              on
+                ? h(
+                    'div',
+                    { style: details },
+                    h(
+                      'label',
+                      null,
+                      `${t('sharesWith')} `,
+                      h(
+                        'select',
+                        {
+                          style: control,
+                          disabled: props.disabled,
+                          value: laneRoot(map, id) === id ? '' : laneRoot(map, id),
+                          onChange: (event) => write(withLane(map, id, event.target.value)),
+                        },
+                        h('option', { value: '' }, t('ownServer')),
+                        roots.map((root) => h('option', { key: root, value: root }, names.get(root) || root)),
+                      ),
+                    ),
+                    laneRoot(map, id) === id
+                      ? h(
+                          'label',
+                          null,
+                          `${t('providerLimit')} `,
+                          h('input', {
+                            style: Object.assign({}, control, { width: '64px' }),
+                            inputMode: 'numeric',
+                            disabled: props.disabled,
+                            placeholder: t('providerLimitDefault'),
+                            value:
+                              typeof entry.maxConcurrentSubagents === 'number'
+                                ? String(entry.maxConcurrentSubagents)
+                                : '',
+                            onChange: (event) => write(withLimit(map, id, event.target.value)),
+                          }),
+                        )
+                      : null,
+                  )
+                : null,
+            )
+          }),
+        )
+      }
+    }
+
+    function createCard(react, ui, store, actions, catalog) {
+      var Providers = ProvidersEditor(react, ui, catalog, actions)
       var h = react.createElement
       var section = { padding: '16px 0', display: 'grid', gap: '12px', minWidth: 0 }
       var heading = {
@@ -293,7 +518,18 @@ window.__ModuleLoader__.load({
             valueField('max', 'maxConcurrentSubagents', 'maxConcurrent', 'maxConcurrentHint', 'invalidInteger', true),
             valueField('timeout', 'queueTimeoutMs', 'queueTimeout', 'queueTimeoutHint', 'invalidInteger', true),
             valueField('tools', 'subagentToolNames', 'toolNames', 'toolNamesHint', 'invalidNames', false),
-            valueField('providers', 'providers', 'providers', 'providersHint', 'invalidProviders', false),
+          ),
+          h(
+            'section',
+            { style: section },
+            h('h3', { style: heading }, t('providersTitle')),
+            h(Providers, { t: t, text: state.providers.text, disabled: disabled }),
+            h(
+              'details',
+              null,
+              h('summary', { style: { cursor: 'pointer', fontSize: '12px' } }, t('advanced')),
+              valueField('providers', 'providers', 'providers', 'providersHint', 'invalidProviders', false),
+            ),
           ),
         )
       }
@@ -323,7 +559,45 @@ window.__ModuleLoader__.load({
         }),
       )
       ctx.effect(() => () => form.dispose(), 'subagent-concurrency-limit: form subscription')
-      var Card = createCard(react, ui, store, form.actions())
+      var catalog = createCatalog()
+      // The model catalog is optional: without it the page keeps the text editor.
+      ctx.inject(['remote.session'], (scope) => {
+        var generation = 0
+        catalog.load = () => {
+          var mine = ++generation
+          catalog.set(Object.assign({}, catalog.getSnapshot(), { status: 'loading' }))
+          Promise.resolve(scope.remote.session.modelCatalog())
+            .then((response) => {
+              if (mine !== generation) return
+              if (response?.ok) {
+                catalog.set({
+                  status: 'ready',
+                  groups: response.value.groups,
+                  partial: response.value.failures.length > 0,
+                })
+              } else catalog.set({ status: 'error', groups: catalog.getSnapshot().groups, partial: false })
+            })
+            .catch(() => {
+              if (mine === generation)
+                catalog.set({ status: 'error', groups: catalog.getSnapshot().groups, partial: false })
+            })
+        }
+        catalog.load()
+        if (typeof scope.remote.$on === 'function') {
+          scope.effect(
+            () => scope.remote.$on('llm/adapters-updated', () => catalog.load()),
+            'subagent-concurrency-limit: catalog refresh',
+          )
+        }
+        scope.effect(
+          () => () => {
+            generation++
+            catalog.load = undefined
+          },
+          'subagent-concurrency-limit: catalog',
+        )
+      })
+      var Card = createCard(react, ui, store, form.actions(), catalog)
 
       // Registered only while the Host serves the entry, so a profile that
       // switched the bundle off shows no form.
@@ -347,6 +621,14 @@ window.__ModuleLoader__.load({
       nonNegativeIntegerField: nonNegativeIntegerField,
       nameListField: nameListField,
       lanesField: lanesField,
+    }
+    module.exports.__lanes = {
+      parseLanes: parseLanes,
+      formatLanes: formatLanes,
+      withProvider: withProvider,
+      withoutProvider: withoutProvider,
+      withLane: withLane,
+      withLimit: withLimit,
     }
     return module.exports
   },
