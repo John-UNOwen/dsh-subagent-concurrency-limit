@@ -1346,6 +1346,45 @@ describe('provider lanes', () => {
     finishTurn(ctx, three)
   })
 
+  it('follows a model switch before the next step instead of the last request', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true, providers: { 'local-a': {} } })
+    const holder = providerAgent('holder', 'local-a')
+    const events: { type: string; data: unknown }[] = []
+    const switcher = {
+      id: 'switcher',
+      options: { subagentDepth: 0, provider: 'local-a' },
+      session: {
+        header: {},
+        get seq() {
+          return events.length
+        },
+        eventAt: (seq: number) => events[seq],
+      },
+      status: 'running',
+    } as unknown as Agent
+    const entered: string[] = []
+
+    // The switcher last ran on local-a, then the holder took local-a's baton.
+    events.push({ type: 'request/header', data: { header: { config: { provider: 'local-a' } } } })
+    await modelStep(ctx, switcher, entered, 'local-a')
+    finishTurn(ctx, switcher)
+    await modelStep(ctx, holder, entered, 'local-a')
+
+    // The user switches the session to an unlisted cloud model: it must not wait for local-a.
+    events.push({ type: 'model/selection', data: { provider: 'deepseek-official', model: 'deepseek-flash' } })
+    let settled = false
+    const next = modelStep(ctx, switcher, entered, 'deepseek-official').finally(() => {
+      settled = true
+    })
+    await flush()
+    assert.strictEqual(settled, true)
+    await next
+    assert.deepStrictEqual(entered, ['switcher', 'holder', 'switcher'])
+    finishTurn(ctx, holder)
+    finishTurn(ctx, switcher)
+  })
+
   it('rejects a malformed providers map', () => {
     assert.throws(() => {
       apply(new Context(), { providers: { 'local-a': { maxConcurrentSubagents: 0 } } })

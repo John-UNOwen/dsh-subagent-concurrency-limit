@@ -630,6 +630,41 @@ class Lane {
   }
 }
 
+/** How far back a step looks in the session log for the current model. */
+const SELECTION_SCAN_LIMIT = 5_000
+
+interface SessionLog {
+  readonly seq: number
+  eventAt(seq: number): { readonly type?: string; readonly data?: unknown } | undefined
+}
+
+/**
+ * The provider the agent's next request will use: the latest `model/selection`
+ * (a model switch) or request header in its session log. A switch is logged
+ * before the next step, so this beats the provider of the last request.
+ */
+function selectedProvider(session: unknown): string | undefined {
+  const log = session as Partial<SessionLog> | undefined
+  if (typeof log?.seq !== 'number' || typeof log.eventAt !== 'function') return undefined
+  const stop = Math.max(0, log.seq - SELECTION_SCAN_LIMIT)
+  for (let seq = log.seq - 1; seq >= stop; seq--) {
+    let event: ReturnType<SessionLog['eventAt']>
+    try {
+      event = log.eventAt(seq)
+    } catch {
+      return undefined
+    }
+    if (event?.type === 'model/selection') {
+      const provider = (event.data as { provider?: unknown } | undefined)?.provider
+      if (typeof provider === 'string') return provider
+    } else if (event?.type === 'request/header') {
+      const header = (event.data as { header?: { config?: { provider?: unknown } } } | undefined)?.header
+      if (typeof header?.config?.provider === 'string') return header.config.provider
+    }
+  }
+  return undefined
+}
+
 /** The key of the single lane used while no providers are listed. */
 const GLOBAL_LANE = '*'
 
@@ -678,10 +713,11 @@ export function apply(ctx: Context, config: Config = {}): void {
     return lane
   }
 
-  function providerOf(agent: { readonly id: unknown; readonly options?: unknown }): string | undefined {
+  function providerOf(agent: { readonly id: unknown; readonly options?: unknown; readonly session?: unknown }) {
     const id = String(agent.id)
     const fromOptions = (agent.options as { provider?: unknown } | undefined)?.provider
     return (
+      selectedProvider(agent.session) ??
       observedProvider.get(id) ??
       expectedProvider.get(id) ??
       (typeof fromOptions === 'string' ? fromOptions : undefined)
