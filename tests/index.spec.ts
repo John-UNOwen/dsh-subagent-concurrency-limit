@@ -1391,3 +1391,77 @@ describe('provider lanes', () => {
     }, /providers must map provider names/)
   })
 })
+
+function projectAgent(id: string, cwd: string, subagentDepth = 0): Agent {
+  return {
+    id,
+    options: { subagentDepth },
+    session: { header: { cwd } },
+    status: 'running',
+  } as unknown as Agent
+}
+
+describe('project priority', () => {
+  async function scenario(config: Parameters<typeof apply>[1], waitBeforeRelease = 0) {
+    const ctx = new Context()
+    apply(ctx, { baton: true, ...config })
+    const holder = projectAgent('holder', 'C:\\work\\alpha')
+    const other = projectAgent('other', 'C:\\work\\beta')
+    const same = projectAgent('same', 'c:/WORK/alpha/')
+    const entered: string[] = []
+
+    await step(ctx, holder, entered)
+    // Another project queues first, then the holder's own project.
+    const otherStep = step(ctx, other, entered)
+    await flush()
+    const sameStep = step(ctx, same, entered)
+    await flush()
+    if (waitBeforeRelease > 0) await new Promise((resolve) => setTimeout(resolve, waitBeforeRelease))
+    finishTurn(ctx, holder)
+    await flush()
+    const next = entered[1]
+    // Let the rest run.
+    finishTurn(ctx, other)
+    finishTurn(ctx, same)
+    await Promise.all([otherStep, sameStep])
+    finishTurn(ctx, other)
+    finishTurn(ctx, same)
+    return next
+  }
+
+  it('hands the baton to the same project before an earlier waiter from another project', async () => {
+    assert.strictEqual(await scenario({}), 'same')
+  })
+
+  it('lets another project go once it has waited projectPriorityMs', async () => {
+    assert.strictEqual(await scenario({ projectPriorityMs: 30 }, 60), 'other')
+  })
+
+  it('is plain first come, first served with projectPriorityMs 0', async () => {
+    assert.strictEqual(await scenario({ projectPriorityMs: 0 }), 'other')
+  })
+
+  it('prefers the same project when lending during a long tool call', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true, lendAfterMs: 30 })
+    const holder = projectAgent('holder', 'C:\\work\\alpha')
+    const other = projectAgent('other', 'C:\\work\\beta')
+    const same = projectAgent('same', 'C:\\work\\alpha')
+    const entered: string[] = []
+
+    await step(ctx, holder, entered)
+    const otherStep = step(ctx, other, entered)
+    await flush()
+    const sameStep = step(ctx, same, entered)
+    let finishTool = () => {}
+    const tool = runTool(ctx, holder, 'pwsh', () => new Promise<void>((resolve) => (finishTool = resolve)))
+    await sameStep
+    assert.deepStrictEqual(entered, ['holder', 'same'])
+    finishTool()
+    await tool
+    finishTurn(ctx, same)
+    finishTurn(ctx, holder)
+    await otherStep
+    finishTurn(ctx, other)
+  })
+})

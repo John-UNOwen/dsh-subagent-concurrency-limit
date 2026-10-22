@@ -78,6 +78,12 @@ a time. Use it with a single-slot local server (for example llama.cpp with
   - Waiting for a tool approval counts as tool time too, whether a human or
     an AI reviewer subagent answers it, so a reviewer can run and others can
     borrow while you decide.
+- When the baton is handed on and no parent or sibling in the same tree is
+  due, a waiting agent of the same project (its session's working folder)
+  goes before agents of other projects, so one codebase's agents run
+  back to back. Once another project's agent has waited `projectPriorityMs`
+  (default 600000, ten minutes) it goes next. `0` makes hand-offs plain first
+  come, first served. Subagents belong to their parent's project.
 - Baton waits have no timeout; they end on the turn's abort signal.
 - The pool still queues root delegations, but a nested delegation that finds
   the pool full is admitted over the limit instead of failing: it cannot
@@ -213,6 +219,7 @@ minutes), which bounds every pool wait.
 `baton` must be a boolean; the code default is `false`, the bundled patch sets
 `true`.
 `lendAfterMs` must be a non-negative safe integer; the default is 30000.
+`projectPriorityMs` must be a non-negative safe integer; the default is 600000.
 
 For a single-slot server also start it so requests queue instead of splitting
 the slot, for example llama.cpp with `-np 1`.

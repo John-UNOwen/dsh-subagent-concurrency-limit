@@ -17,6 +17,7 @@ export const inject = ['tools']
 const DEFAULT_MAX_CONCURRENT_SUBAGENTS = 2
 const DEFAULT_QUEUE_TIMEOUT_MS = 300_000
 const DEFAULT_LEND_AFTER_MS = 30_000
+const DEFAULT_PROJECT_PRIORITY_MS = 600_000
 /** Node fires any longer timer after 1 ms, so every wait is clamped to this. */
 const MAX_TIMER_MS = 2_147_483_647
 
@@ -35,6 +36,12 @@ export interface Config {
   baton?: Live<boolean>
   /** In baton mode, how long the holder may sit in tool calls before a non-descendant may borrow the baton. */
   lendAfterMs?: Live<number>
+  /**
+   * In baton mode, hand the baton to a waiting agent of the same project
+   * (session working folder) first, unless another project's agent has waited
+   * this long. 0 turns the preference off (plain first come, first served).
+   */
+  projectPriorityMs?: Live<number>
   /**
    * Per-provider lanes. Each listed provider gets its own baton and pool;
    * unset fields inherit the top-level ones. When empty, one global lane
@@ -66,6 +73,13 @@ export const Config = Schema.object({
   baton: Schema.boolean()
     .default(false)
     .description('Only one agent, the root included, generates at a time.')
+    .volatile(),
+  projectPriorityMs: Schema.natural()
+    .max(Number.MAX_SAFE_INTEGER)
+    .default(DEFAULT_PROJECT_PRIORITY_MS)
+    .description(
+      'Baton mode: prefer the same project when handing the baton on, for up to this many milliseconds per waiting agent of another project; 0 turns it off.',
+    )
     .volatile(),
   lendAfterMs: Schema.natural()
     .max(Number.MAX_SAFE_INTEGER)
@@ -219,6 +233,8 @@ interface BatonWaiter {
   readonly resolve: () => void
   readonly reject: (reason?: unknown) => void
   readonly abort: () => void
+  /** When the agent started waiting, for project priority. */
+  readonly since: number
 }
 
 /**
@@ -245,11 +261,21 @@ class Baton {
   private readonly depths = new Map<string, number>()
   private readonly parents = new Map<string, string>()
   private readonly lendAfterMs: () => number
+  private readonly projectOf: (id: string) => string | undefined
+  private readonly projectPriorityMs: () => number
+  /** Project of the agent that last gave the baton up. */
+  private lastProject: string | undefined
   private lendTimer: ReturnType<typeof setTimeout> | undefined
   private closed = false
 
-  constructor(lendAfterMs: () => number) {
+  constructor(
+    lendAfterMs: () => number,
+    projectOf: (id: string) => string | undefined = () => undefined,
+    projectPriorityMs: () => number = () => 0,
+  ) {
     this.lendAfterMs = lendAfterMs
+    this.projectOf = projectOf
+    this.projectPriorityMs = projectPriorityMs
   }
 
   async acquire(id: string, signal: AbortSignal, depth: number): Promise<void> {
@@ -272,6 +298,7 @@ class Baton {
     await new Promise<void>((resolve, reject) => {
       const waiter: BatonWaiter = {
         id,
+        since: Date.now(),
         signal,
         resolve,
         reject,
@@ -328,6 +355,7 @@ class Baton {
     const index = this.suspended.indexOf(id)
     if (index >= 0) this.suspended.splice(index, 1)
     if (this.owner !== id) return
+    this.lastProject = this.projectOf(id)
     this.owner = undefined
     this.passOn()
   }
@@ -424,7 +452,19 @@ class Baton {
     this.settle()
   }
 
-  /** Pick the next owner: delegated siblings, then the parent, then FIFO. */
+  /**
+   * Choose among waiters, oldest first: one from `project` goes ahead of other
+   * projects, unless another project's agent has waited projectPriorityMs.
+   */
+  private pick(candidates: readonly BatonWaiter[], project: string | undefined): BatonWaiter | undefined {
+    const limit = this.projectPriorityMs()
+    if (project === undefined || limit <= 0) return candidates[0]
+    const now = Date.now()
+    const overdue = candidates.find((waiter) => this.projectOf(waiter.id) !== project && now - waiter.since >= limit)
+    return overdue ?? candidates.find((waiter) => this.projectOf(waiter.id) === project) ?? candidates[0]
+  }
+
+  /** Pick the next owner: delegated siblings, then the parent, then the waiters. */
   private passOn(): void {
     const top = this.suspended.at(-1)
     if (top !== undefined) {
@@ -438,7 +478,10 @@ class Baton {
         this.owner = top
       }
     } else {
-      this.owner = this.waiters.find((waiter) => !this.suspended.includes(waiter.id))?.id
+      this.owner = this.pick(
+        this.waiters.filter((waiter) => !this.suspended.includes(waiter.id)),
+        this.lastProject,
+      )?.id
     }
     this.settle()
   }
@@ -447,7 +490,10 @@ class Baton {
   private settle(): void {
     while (this.owner !== undefined && this.busyInTools(this.owner)) {
       const owner = this.owner
-      const borrower = this.waiters.find((waiter) => this.mayBorrow(waiter.id))
+      const borrower = this.pick(
+        this.waiters.filter((waiter) => this.mayBorrow(waiter.id)),
+        this.projectOf(owner),
+      )
       if (borrower === undefined) break
       this.suspended.push(owner)
       this.owner = borrower.id
@@ -490,6 +536,7 @@ interface Settings {
   subagentToolNames(): ReadonlySet<string>
   baton(): boolean
   lendAfterMs(): number
+  projectPriorityMs(): number
   providers(): Readonly<Record<string, ProviderConfig>>
 }
 
@@ -566,6 +613,12 @@ function resolveConfig(config: Config): Settings {
     (value): value is number => Number.isSafeInteger(value) && (value as number) >= 0,
     'lendAfterMs must be a non-negative safe integer',
   )
+  const projectPriorityMs = liveField(
+    config.projectPriorityMs,
+    DEFAULT_PROJECT_PRIORITY_MS,
+    (value): value is number => Number.isSafeInteger(value) && (value as number) >= 0,
+    'projectPriorityMs must be a non-negative safe integer',
+  )
   const providers = liveField<Readonly<Record<string, ProviderConfig>>>(
     config.providers,
     {},
@@ -579,6 +632,7 @@ function resolveConfig(config: Config): Settings {
     queueTimeoutMs,
     baton,
     lendAfterMs,
+    projectPriorityMs,
     providers,
     subagentToolNames() {
       const current = names()
@@ -606,11 +660,18 @@ class Lane {
   private readonly batonSetting: () => boolean
   private batonWasOn: boolean
 
-  constructor(key: string, batonSetting: () => boolean, limit: () => number, lendAfterMs: () => number) {
+  constructor(
+    key: string,
+    batonSetting: () => boolean,
+    limit: () => number,
+    lendAfterMs: () => number,
+    projectOf?: (id: string) => string | undefined,
+    projectPriorityMs?: () => number,
+  ) {
     this.key = key
     this.batonSetting = batonSetting
     this.gate = new ConcurrencyGate(limit)
-    this.baton = new Baton(lendAfterMs)
+    this.baton = new Baton(lendAfterMs, projectOf, projectPriorityMs)
     this.batonWasOn = batonSetting()
   }
 
@@ -665,6 +726,11 @@ function selectedProvider(session: unknown): string | undefined {
   return undefined
 }
 
+/** Compare working folders the way Windows does: case and slash insensitive. */
+function projectKey(cwd: string): string {
+  return cwd.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+}
+
 /** The key of the single lane used while no providers are listed. */
 const GLOBAL_LANE = '*'
 
@@ -677,6 +743,12 @@ export function apply(ctx: Context, config: Config = {}): void {
   const observedProvider = new Map<string, string>()
   /** Provider a published child is expected to use until it makes a request. */
   const expectedProvider = new Map<string, string>()
+  /** Project (session working folder) of each agent; children inherit their parent's. */
+  const projectByAgent = new Map<string, string>()
+  function noteProject(agent: { readonly id: unknown; readonly session?: unknown }): void {
+    const cwd = (agent.session as { header?: { cwd?: unknown } } | undefined)?.header?.cwd
+    if (typeof cwd === 'string' && cwd.length > 0) projectByAgent.set(String(agent.id), projectKey(cwd))
+  }
   /** Lane whose baton an agent took for its current step. */
   const batonLaneOf = new Map<string, Lane>()
 
@@ -707,6 +779,8 @@ export function apply(ctx: Context, config: Config = {}): void {
         () => own()?.baton ?? settings.baton(),
         () => own()?.maxConcurrentSubagents ?? settings.limit(),
         () => own()?.lendAfterMs ?? settings.lendAfterMs(),
+        (id) => projectByAgent.get(id),
+        settings.projectPriorityMs,
       )
       lanes.set(key, lane)
     }
@@ -783,6 +857,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     'agent/pre-step',
     async (info, next) => {
       pumpAll()
+      noteProject(info.agent)
       await takeBaton(
         String(info.agent.id),
         delegationDepthOf(info.agent),
@@ -806,6 +881,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       }
       const lane = laneFor(provider ?? providerOf(info.agent))
       if (batonLaneOf.get(agentId) !== lane || (lane?.batonOn() && !batonLaneOf.has(agentId))) {
+        noteProject(info.agent)
         await takeBaton(agentId, delegationDepthOf(info.agent), lane, info.signal)
       }
       return call
@@ -917,6 +993,8 @@ export function apply(ctx: Context, config: Config = {}): void {
     }
     const childId = String(info.id)
     const parentId = toolAgent.getStore()
+    const parentProject = parentId === undefined ? undefined : projectByAgent.get(parentId)
+    if (parentProject !== undefined && !projectByAgent.has(childId)) projectByAgent.set(childId, parentProject)
     const expected = reservation?.provider ?? (parentId === undefined ? undefined : observedProvider.get(parentId))
     if (info.local && expected !== undefined && !observedProvider.has(childId)) expectedProvider.set(childId, expected)
 
@@ -1032,6 +1110,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     batonLaneOf.delete(agentId)
     observedProvider.delete(agentId)
     expectedProvider.delete(agentId)
+    projectByAgent.delete(agentId)
     for (const [runId, run] of startsByRunId) {
       if (!run.local || run.agentId !== agentId) continue
       run.ended = true

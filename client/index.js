@@ -26,6 +26,9 @@ window.__ModuleLoader__.load({
       lendAfterHint:
         'While the baton holder runs a tool, another agent may take the slot only after this long. Its own subagents may at once. Short tool calls keep the prompt cache warm.',
       invalidNonNegative: 'Enter a whole number of 0 or more.',
+      projectPriority: 'Same-project priority (ms)',
+      projectPriorityHint:
+        'When the baton is handed on, agents of the same project (working folder) go first, unless another project has waited this long. 0 is plain first come, first served.',
       providers: 'Per-provider lanes',
       providersHint:
         'Give each listed provider its own baton and limit, e.g. "gpu-a: limit=4; gpu-a-alt: lane=gpu-a; gpu-b: limit=1 lend=60000". Providers on the same server should share a lane. Unlisted providers run freely. Leave empty for one lane covering every agent.',
@@ -71,6 +74,8 @@ window.__ModuleLoader__.load({
       lendAfterHint:
         '持棒代理执行工具时，其他代理需等待这么久才能借用槽位；它自己的子代理可立即借用。短工具调用可保持提示缓存。',
       invalidNonNegative: '请输入不小于 0 的整数。',
+      projectPriority: '同项目优先（毫秒）',
+      projectPriorityHint: '交接接力棒时，同一项目（工作目录）的代理优先，除非其他项目已等待这么久。0 表示先到先得。',
       providers: '按提供方分道',
       providersHint:
         '为列出的每个提供方单独设置接力棒和上限，例如 "gpu-a: limit=4; gpu-a-alt: lane=gpu-a; gpu-b: limit=1 lend=60000"。同一服务器上的提供方应共用一道。未列出的提供方不受限制。留空则所有代理共用一道。',
@@ -516,6 +521,14 @@ window.__ModuleLoader__.load({
             ),
             h('p', { style: hint }, t('batonHint')),
             valueField('lend', 'lendAfterMs', 'lendAfter', 'lendAfterHint', 'invalidNonNegative', true),
+            valueField(
+              'project',
+              'projectPriorityMs',
+              'projectPriority',
+              'projectPriorityHint',
+              'invalidNonNegative',
+              true,
+            ),
             state.baton.overridden
               ? h(
                   'button',
@@ -556,6 +569,7 @@ window.__ModuleLoader__.load({
       var form = new ui.SettingsFormModel(ctx.configForms.get(ENTRY_ID), [
         booleanField('baton'),
         nonNegativeIntegerField('lendAfterMs'),
+        nonNegativeIntegerField('projectPriorityMs'),
         positiveIntegerField('maxConcurrentSubagents'),
         positiveIntegerField('queueTimeoutMs'),
         nameListField('subagentToolNames'),
@@ -565,6 +579,7 @@ window.__ModuleLoader__.load({
         Object.assign(form.shell(), {
           baton: form.field('baton'),
           lendAfterMs: form.field('lendAfterMs'),
+          projectPriorityMs: form.field('projectPriorityMs'),
           maxConcurrentSubagents: form.field('maxConcurrentSubagents'),
           queueTimeoutMs: form.field('queueTimeoutMs'),
           subagentToolNames: form.field('subagentToolNames'),

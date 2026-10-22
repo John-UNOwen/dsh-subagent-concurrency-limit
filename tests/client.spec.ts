@@ -28,6 +28,7 @@ function loadClient() {
     failed: false,
     baton: field('true'),
     lendAfterMs: field('30000'),
+    projectPriorityMs: field('600000'),
     maxConcurrentSubagents: field('4'),
     queueTimeoutMs: field('300000'),
     subagentToolNames: field('subagent'),
@@ -147,7 +148,15 @@ describe('client settings page', () => {
     })
     assert.deepStrictEqual(
       specs.map((spec) => spec.field),
-      ['baton', 'lendAfterMs', 'maxConcurrentSubagents', 'queueTimeoutMs', 'subagentToolNames', 'providers'],
+      [
+        'baton',
+        'lendAfterMs',
+        'projectPriorityMs',
+        'maxConcurrentSubagents',
+        'queueTimeoutMs',
+        'subagentToolNames',
+        'providers',
+      ],
     )
   })
 
