@@ -1465,3 +1465,65 @@ describe('project priority', () => {
     finishTurn(ctx, other)
   })
 })
+
+describe('review fixes', () => {
+  it('does not hand the baton to a queued sibling that already ran by borrowing', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true, maxConcurrentSubagents: 4, lendAfterMs: 30 })
+    const root = mockAgent('root')
+    const a = mockAgent('a', 1)
+    const b = mockAgent('b', 1)
+    const entered: string[] = []
+
+    await step(ctx, root, entered)
+    // One step spawns both: A gets the baton, B is queued behind it.
+    await Promise.all([
+      toolCall(ctx, root, 'run-a', entered, { childId: a.id }),
+      toolCall(ctx, root, 'run-b', entered, { childId: b.id }),
+    ])
+    await step(ctx, a, entered)
+    const bStep = step(ctx, b, entered)
+    // A sits in a long tool: B borrows after lendAfterMs, runs, and finishes.
+    let finishTool = () => {}
+    const tool = runTool(ctx, a, 'pwsh', () => new Promise<void>((resolve) => (finishTool = resolve)))
+    await bStep
+    finishTurn(ctx, b)
+    endRun(ctx, 'run-b')
+    finishTool()
+    await tool
+    await step(ctx, a, entered)
+    finishTurn(ctx, a)
+    endRun(ctx, 'run-a')
+
+    // Both children are done: the root must resume, not wait on B forever.
+    let settled = false
+    const rootNext = step(ctx, root, entered).finally(() => {
+      settled = true
+    })
+    await flush()
+    assert.strictEqual(settled, true)
+    await rootNext
+    finishTurn(ctx, root)
+  })
+
+  it('does not admit past a lowered limit when a slot frees up', async () => {
+    const ctx = new Context()
+    const limit = live(2)
+    apply(ctx, { maxConcurrentSubagents: limit })
+    const root = mockAgent('root')
+    const entered: string[] = []
+
+    await toolCall(ctx, root, 'one', entered)
+    await toolCall(ctx, root, 'two', entered)
+    const three = toolCall(ctx, root, 'three', entered)
+    limit.set(1)
+    // Two still run against a limit of one: freeing one must not admit three.
+    endRun(ctx, 'one')
+    await flush()
+    assert.deepStrictEqual(entered, ['one', 'two'])
+    endRun(ctx, 'two')
+    await three
+    assert.deepStrictEqual(entered, ['one', 'two', 'three'])
+    endRun(ctx, 'three')
+  })
+})

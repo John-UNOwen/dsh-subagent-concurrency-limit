@@ -196,7 +196,9 @@ class ConcurrencyGate {
 
   release(key: object): void {
     if (!this.active.delete(key)) return
-    this.admitNext()
+    // Only admit while under the limit: forced admissions or a lowered limit
+    // can leave the pool above it.
+    this.pump()
   }
 
   close(): void {
@@ -354,6 +356,13 @@ class Baton {
   release(id: string): void {
     const index = this.suspended.indexOf(id)
     if (index >= 0) this.suspended.splice(index, 1)
+    // An idle agent is owed nothing: a queued child that already ran (by
+    // borrowing) would otherwise be handed the baton and never step.
+    for (const [parent, queue] of this.delegated) {
+      const queued = queue.indexOf(id)
+      if (queued >= 0) queue.splice(queued, 1)
+      if (queue.length === 0) this.delegated.delete(parent)
+    }
     if (this.owner !== id) return
     this.lastProject = this.projectOf(id)
     this.owner = undefined
