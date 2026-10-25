@@ -256,6 +256,8 @@ interface BatonWaiter {
 class Baton {
   private owner: string | undefined
   private readonly suspended: string[] = []
+  /** Suspended agents that lent the baton out (rather than handing it to their child). */
+  private readonly lenders = new Set<string>()
   private readonly delegated = new Map<string, string[]>()
   private readonly waiters: BatonWaiter[] = []
   private readonly inTools = new Map<string, number>()
@@ -323,6 +325,7 @@ class Baton {
     this.parents.set(child, parent)
     if (this.owner === parent) {
       this.suspended.push(parent)
+      this.lenders.delete(parent)
       this.owner = child
       this.settle()
     } else if (this.suspended.includes(parent)) {
@@ -356,6 +359,7 @@ class Baton {
   release(id: string): void {
     const index = this.suspended.indexOf(id)
     if (index >= 0) this.suspended.splice(index, 1)
+    this.lenders.delete(id)
     // An idle agent is owed nothing: a queued child that already ran (by
     // borrowing) would otherwise be handed the baton and never step.
     for (const [parent, queue] of this.delegated) {
@@ -387,6 +391,7 @@ class Baton {
     this.clearLendTimer()
     this.owner = undefined
     this.suspended.length = 0
+    this.lenders.clear()
     this.delegated.clear()
     for (const waiter of this.waiters.splice(0)) {
       waiter.signal.removeEventListener('abort', waiter.abort)
@@ -433,8 +438,19 @@ class Baton {
   private mayBorrow(id: string): boolean {
     const owner = this.owner
     const toolTime = this.ownerToolTime()
-    if (owner === undefined || toolTime === undefined || id === owner || this.suspended.includes(id)) return false
+    if (owner === undefined || toolTime === undefined || id === owner) return false
+    // A parent that handed the baton to its child waits for it. A lender may
+    // take the baton back like anyone else, unless it is the owner's ancestor.
+    if (this.suspended.includes(id) && (!this.lenders.has(id) || this.isAncestorOf(id, owner))) return false
     return this.descendsFrom(id, owner) || toolTime >= this.lendAfterMs()
+  }
+
+  /** Whether `id` is an ancestor of `agent`. Agents of different projects never are. */
+  private isAncestorOf(id: string, agent: string): boolean {
+    const project = this.projectOf(id)
+    const other = this.projectOf(agent)
+    if (project !== undefined && other !== undefined && project !== other) return false
+    return this.descendsFrom(agent, id)
   }
 
   private clearLendTimer(): void {
@@ -456,9 +472,21 @@ class Baton {
   }
 
   private lendTo(id: string): void {
-    if (this.owner !== undefined) this.suspended.push(this.owner)
-    this.owner = id
+    this.lend(id)
     this.settle()
+  }
+
+  /** The owner lends the baton to `id`; a lender taking it back leaves the stack. */
+  private lend(id: string): void {
+    const owner = this.owner
+    const index = this.suspended.indexOf(id)
+    if (index >= 0) this.suspended.splice(index, 1)
+    this.lenders.delete(id)
+    if (owner !== undefined) {
+      this.suspended.push(owner)
+      this.lenders.add(owner)
+    }
+    this.owner = id
   }
 
   /**
@@ -484,6 +512,7 @@ class Baton {
         this.owner = child
       } else {
         this.suspended.pop()
+        this.lenders.delete(top)
         this.owner = top
       }
     } else {
@@ -504,8 +533,7 @@ class Baton {
         this.projectOf(owner),
       )
       if (borrower === undefined) break
-      this.suspended.push(owner)
-      this.owner = borrower.id
+      this.lend(borrower.id)
     }
     this.scheduleLend()
     for (const waiter of [...this.waiters]) {

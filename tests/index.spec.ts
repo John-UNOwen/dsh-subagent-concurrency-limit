@@ -1527,3 +1527,61 @@ describe('review fixes', () => {
     endRun(ctx, 'three')
   })
 })
+
+describe('lender reclaim', () => {
+  it('lets a lender take the baton back while the borrower sits in a long tool', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true, lendAfterMs: 30 })
+    const mfg = projectAgent('mfg', 'C:\\work\\mfg')
+    const wux = projectAgent('wux', 'C:\\work\\wux')
+    const entered: string[] = []
+
+    await step(ctx, mfg, entered)
+    const wuxStep = step(ctx, wux, entered)
+    // mfg sits in a long tool: wux borrows after lendAfterMs.
+    let finishMfgTool = () => {}
+    const mfgTool = runTool(ctx, mfg, 'pwsh', () => new Promise<void>((resolve) => (finishMfgTool = resolve)))
+    await wuxStep
+    finishMfgTool()
+    await mfgTool
+    const mfgNext = step(ctx, mfg, entered)
+    await flush()
+    assert.deepStrictEqual(entered, ['mfg', 'wux'])
+
+    // Now wux sits in a long tool of its own: mfg must get the baton back after lendAfterMs.
+    let finishWuxTool = () => {}
+    const wuxTool = runTool(ctx, wux, 'pwsh', () => new Promise<void>((resolve) => (finishWuxTool = resolve)))
+    await mfgNext
+    assert.deepStrictEqual(entered, ['mfg', 'wux', 'mfg'])
+
+    finishWuxTool()
+    await wuxTool
+    finishTurn(ctx, mfg)
+    await step(ctx, wux, entered)
+    assert.deepStrictEqual(entered.slice(-1), ['wux'])
+    finishTurn(ctx, wux)
+  })
+
+  it('still never lets a delegation parent take the baton from its child', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true, maxConcurrentSubagents: 4, lendAfterMs: 30 })
+    const root = projectAgent('root', 'C:\\work\\x')
+    const child = projectAgent('child', 'C:\\work\\x', 1)
+    const entered: string[] = []
+
+    await step(ctx, root, entered)
+    await toolCall(ctx, root, 'child-run', entered, { childId: child.id })
+    await step(ctx, child, entered)
+    let finishTool = () => {}
+    const tool = runTool(ctx, child, 'pwsh', () => new Promise<void>((resolve) => (finishTool = resolve)))
+    const rootNext = step(ctx, root, entered)
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    assert.deepStrictEqual(entered, ['root', 'child-run', 'child'])
+    finishTool()
+    await tool
+    finishTurn(ctx, child)
+    endRun(ctx, 'child-run')
+    await rootNext
+    finishTurn(ctx, root)
+  })
+})
