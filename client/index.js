@@ -45,6 +45,7 @@ window.__ModuleLoader__.load({
       catalogLoading: 'Loading providers…',
       catalogError: 'Could not load the provider list.',
       catalogPartial: 'Some providers could not be listed.',
+      catalogUnavailable: 'The provider list is not available here; use Edit as text.',
       refresh: 'Refresh',
       advanced: 'Edit as text',
       limitsTitle: 'Limits',
@@ -92,6 +93,7 @@ window.__ModuleLoader__.load({
       catalogLoading: '正在加载提供方…',
       catalogError: '无法加载提供方列表。',
       catalogPartial: '部分提供方无法列出。',
+      catalogUnavailable: '此处无法获取提供方列表，请使用“以文本编辑”。',
       refresh: '刷新',
       advanced: '以文本编辑',
       limitsTitle: '限制',
@@ -149,13 +151,21 @@ window.__ModuleLoader__.load({
 
     var LANE_KEYS = { lane: 'lane', baton: 'baton', limit: 'maxConcurrentSubagents', lend: 'lendAfterMs' }
 
+    // Names and lane values that hold spaces or any of ; : = " are written as
+    // JSON strings, so every provider id round-trips through the text form.
+    function quote(text, bareOk) {
+      return bareOk.test(text) ? text : JSON.stringify(text)
+    }
+    var BARE_NAME = /^[^\s;:="]+$/
+    var BARE_VALUE = /^[^\s;"]+$/
+
     function formatLanes(value) {
       if (typeof value !== 'object' || value === null) return ''
       return Object.keys(value)
         .map((name) => {
           var lane = value[name] || {}
-          var parts = [`${name}:`]
-          if (typeof lane.lane === 'string') parts.push(`lane=${lane.lane}`)
+          var parts = [`${quote(name, BARE_NAME)}:`]
+          if (typeof lane.lane === 'string') parts.push(`lane=${quote(lane.lane, BARE_VALUE)}`)
           if (typeof lane.baton === 'boolean') parts.push(`baton=${lane.baton ? 'on' : 'off'}`)
           if (typeof lane.maxConcurrentSubagents === 'number') parts.push(`limit=${lane.maxConcurrentSubagents}`)
           if (typeof lane.lendAfterMs === 'number') parts.push(`lend=${lane.lendAfterMs}`)
@@ -164,30 +174,75 @@ window.__ModuleLoader__.load({
         .join('; ')
     }
 
+    /** Read a JSON string starting at `start`; returns [value, next index] or undefined. */
+    function readQuoted(text, start) {
+      for (let i = start + 1; i < text.length; i++) {
+        if (text[i] === '\\') i++
+        else if (text[i] === '"') {
+          try {
+            let value = JSON.parse(text.slice(start, i + 1))
+            return typeof value === 'string' ? [value, i + 1] : undefined
+          } catch {
+            return undefined
+          }
+        }
+      }
+      return undefined
+    }
+
     function parseLanes(text) {
       const lanes = {}
-      const entries = text
-        .split(/[;\n]/)
-        .map((entry) => entry.trim())
-        .filter((entry) => entry.length > 0)
-      for (const entry of entries) {
-        const colon = entry.indexOf(':')
-        const name = (colon < 0 ? entry : entry.slice(0, colon)).trim()
+      let i = 0
+      const isSpace = (ch) => ch === ' ' || ch === '\t' || ch === '\r'
+      const isEnd = (ch) => ch === undefined || ch === ';' || ch === '\n'
+      while (i < text.length) {
+        while (i < text.length && (isSpace(text[i]) || isEnd(text[i]))) i++
+        if (i >= text.length) break
+        // The name: a JSON string, or plain text up to ':' or the entry's end.
+        let name
+        if (text[i] === '"') {
+          let quoted = readQuoted(text, i)
+          if (quoted === undefined) return undefined
+          name = quoted[0]
+          i = quoted[1]
+          while (isSpace(text[i])) i++
+          if (text[i] !== ':' && !isEnd(text[i])) return undefined
+        } else {
+          let from = i
+          while (!isEnd(text[i]) && text[i] !== ':') i++
+          name = text.slice(from, i).trim()
+        }
         if (name.length === 0 || Object.hasOwn(lanes, name)) return undefined
+        if (text[i] === ':') i++
         const lane = {}
-        const rest = colon < 0 ? '' : entry.slice(colon + 1).trim()
-        for (const token of rest.split(/\s+/).filter((part) => part.length > 0)) {
-          const match = /^(lane|baton|limit|lend)=(.+)$/.exec(token)
+        for (;;) {
+          while (isSpace(text[i])) i++
+          if (isEnd(text[i])) break
+          let match = /^(lane|baton|limit|lend)=/.exec(text.slice(i))
           if (match === null) return undefined
+          i += match[0].length
+          let raw
+          if (text[i] === '"') {
+            let value = readQuoted(text, i)
+            if (value === undefined) return undefined
+            raw = value[0]
+            i = value[1]
+            if (!isSpace(text[i]) && !isEnd(text[i])) return undefined
+          } else {
+            let begin = i
+            while (!isSpace(text[i]) && !isEnd(text[i])) i++
+            raw = text.slice(begin, i)
+          }
           const key = LANE_KEYS[match[1]]
           if (key === 'lane') {
-            lane.lane = match[2]
+            if (raw.length === 0) return undefined
+            lane.lane = raw
           } else if (key === 'baton') {
-            if (match[2] !== 'on' && match[2] !== 'off') return undefined
-            lane.baton = match[2] === 'on'
+            if (raw !== 'on' && raw !== 'off') return undefined
+            lane.baton = raw === 'on'
           } else {
-            if (!/^\d+$/.test(match[2])) return undefined
-            const number = Number(match[2])
+            if (!/^\d+$/.test(raw)) return undefined
+            const number = Number(raw)
             if (!Number.isSafeInteger(number) || (key === 'maxConcurrentSubagents' && number < 1)) return undefined
             lane[key] = number
           }
@@ -288,6 +343,7 @@ window.__ModuleLoader__.load({
           return () => listeners.delete(listener)
         },
         getSnapshot: () => snapshot,
+        listening: () => listeners.size > 0,
         set: (next) => {
           snapshot = next
           for (var listener of listeners) listener()
@@ -343,7 +399,11 @@ window.__ModuleLoader__.load({
         }
 
         var status = null
-        if (listing.status === 'loading' || listing.status === 'idle')
+        // Without a model catalog (no remote, or it went away mid-request)
+        // nothing will ever load: say so instead of "Loading…" forever.
+        if (!catalog.load && (listing.status === 'loading' || listing.status === 'idle'))
+          status = h('p', { style: hint }, t('catalogUnavailable'))
+        else if (listing.status === 'loading' || listing.status === 'idle')
           status = h(
             'p',
             { style: hint },
@@ -627,7 +687,7 @@ window.__ModuleLoader__.load({
             })
         }
         // Already on screen: load now; otherwise the first subscribe loads.
-        if (catalog.getSnapshot().status !== 'idle') catalog.load()
+        if (catalog.getSnapshot().status !== 'idle' || catalog.listening()) catalog.load()
         if (typeof scope.on === 'function') {
           scope.effect(
             () =>
@@ -648,6 +708,12 @@ window.__ModuleLoader__.load({
           () => () => {
             generation++
             catalog.load = undefined
+            // A request in flight is abandoned: go back to idle, so the next
+            // remote loads on its own, and re-render to show the state.
+            var snapshot = catalog.getSnapshot()
+            catalog.set(
+              Object.assign({}, snapshot, { status: snapshot.status === 'loading' ? 'idle' : snapshot.status }),
+            )
           },
           'subagent-concurrency-limit: catalog',
         )

@@ -413,7 +413,7 @@ describe('subagent concurrency limit', () => {
     endRun(ctx, 'queued')
   })
 
-  it('fails loudly for a reservation-less local run when the pool is full', async () => {
+  it('queues a reservation-less child of a root agent when the pool is full', async () => {
     const ctx = new Context()
     apply(ctx, { maxConcurrentSubagents: 1 })
     const root = mockAgent('root')
@@ -421,12 +421,16 @@ describe('subagent concurrency limit', () => {
     const entered: string[] = []
 
     await toolCall(ctx, root, 'active', entered)
-    // No tool call at all: the publish lost the reservation (lost ALS store).
+    // No tool call at all: the publish lost the reservation (lost ALS store),
+    // or came from a tool outside subagentToolNames. The root holds no permit,
+    // so its child waits for one like a root delegation.
     startLocalRun(ctx, 'orphan', child.id)
-    await assert.rejects(step(ctx, child, entered), /exhausted for reservation-less local child turn/)
+    const childStep = step(ctx, child, entered)
+    await flush()
+    assert.deepStrictEqual(entered, ['active'])
 
     endRun(ctx, 'active')
-    await step(ctx, child, entered)
+    await childStep
     finishTurn(ctx, child)
     endRun(ctx, 'orphan')
     assert.deepStrictEqual(entered, ['active', 'child'])
@@ -590,14 +594,12 @@ describe('baton', () => {
     const entered: string[] = []
 
     await step(ctx, root, entered)
-    const workerStep = step(ctx, worker, entered)
-    await flush()
-    assert.deepStrictEqual(entered, ['root'])
 
-    // The root waits in a tool for the untracked worker: the worker borrows the baton.
+    // The root waits in a tool for an untracked worker that tool started:
+    // the worker borrows the baton.
     let finishTool = () => {}
     const tool = runTool(ctx, root, 'wait', () => new Promise<void>((resolve) => (finishTool = resolve)))
-    await workerStep
+    await step(ctx, worker, entered)
     assert.deepStrictEqual(entered, ['root', 'worker'])
 
     finishTool()
@@ -842,10 +844,9 @@ describe('baton', () => {
     const entered: string[] = []
 
     await step(ctx, root, entered)
-    const workerStep = step(ctx, worker, entered)
     let finishTool = () => {}
     const tool = runTool(ctx, root, 'workflow', () => new Promise<void>((resolve) => (finishTool = resolve)))
-    await workerStep
+    await step(ctx, worker, entered)
     assert.deepStrictEqual(entered, ['root', 'worker'])
     finishTurn(ctx, worker)
     finishTool()
@@ -1062,7 +1063,7 @@ describe('permit leaks seen in a live fan-out', () => {
     endRun(ctx, 'holder')
   })
 
-  it('reports a resumed child turn on a full pool clearly with the baton off', async () => {
+  it('queues a resumed root child turn on a full pool with the baton off', async () => {
     const ctx = new Context()
     apply(ctx, { maxConcurrentSubagents: 1 })
     const root = mockAgent('root')
@@ -1073,9 +1074,11 @@ describe('permit leaks seen in a live fan-out', () => {
     await step(ctx, child, entered)
     finishTurn(ctx, child)
     await toolCall(ctx, root, 'holder', entered)
-    await assert.rejects(step(ctx, child, entered), /exhausted for reservation-less local child turn/)
+    const resumed = step(ctx, child, entered)
+    await flush()
+    assert.deepStrictEqual(entered, ['child-run', 'child', 'holder'])
     endRun(ctx, 'holder')
-    await step(ctx, child, entered)
+    await resumed
     finishTurn(ctx, child)
     endRun(ctx, 'child-run')
   })

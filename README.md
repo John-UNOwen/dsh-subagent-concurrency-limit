@@ -39,11 +39,17 @@ one process-local pool. The default limit is `2`.
 - Pool waits are bounded: a root delegation call or a resumed local child turn
   that has been queued for `queueTimeoutMs` (default 300000, five minutes) fails
   with a clear error instead of waiting forever.
-- A locally published child whose reservation was lost (for example a
-  background job that published outside the delegating call's async context)
-  never queues: it takes a permit immediately when one is free and fails loudly
-  when the pool is full, so it cannot block the ancestor that is waiting for
-  it.
+- A delegation that fails or is cancelled frees its permit at once, whether
+  the tool throws or returns an error result.
+- A local child with no reservation (one published by a tool outside
+  `subagentToolNames`, such as `subagent_fork` or `workflow`, or whose publish
+  lost the delegating call's async context) queues like a root delegation when
+  its parent is a root agent. A deeper one never queues: it takes a permit
+  immediately when one is free and fails loudly when the pool is full, so it
+  cannot block the ancestor that is waiting for it.
+- With the baton on, nested children are admitted over a full pool. They do
+  not count against the limit, so they never hold up a queued root
+  delegation.
 - For remote-process providers such as Codex, Claude Code, and ACP, only the
   configured root delegation admission and the observable `subagent/start` and
   `subagent/end` boundaries are visible. Nested execution and restarts inside
@@ -59,7 +65,8 @@ a time. Use it with a single-slot local server (for example llama.cpp with
 
 - The agent holding the baton keeps it across its steps until it goes idle.
 - A delegation that publishes a local child passes the baton to the child and
-  pauses the parent. The parent's next step waits until the child goes idle,
+  pauses the parent. A background child published while the parent is already
+  generating its next step waits for that step to finish. The parent's next step waits until the child goes idle,
   its run ends, or it is disposed.
 - Children delegated by a paused parent run one at a time in order, and the
   parent resumes after the last one.
@@ -69,8 +76,10 @@ a time. Use it with a single-slot local server (for example llama.cpp with
 - While the holder is inside a tool call it is not generating, so another
   agent may borrow the baton:
   - its own descendants at once, which prevents a deadlock when a parent
-    waits on a child (including one the plugin cannot link to it, such as a
-    workflow `agent()` call);
+    waits on a child. A deeper agent the plugin cannot link to the holder
+    (such as a workflow `agent()` call) counts only if it first asks for the
+    baton during the holder's current tool call and is not of another
+    project; an older one, such as a resumed session, waits like anyone else;
   - anyone else only after the holder has spent `lendAfterMs` (default
     30000) in tools. Short tool calls keep the baton, and the prompt cache,
     with the agent that made them; a long one lets others use the idle slot.
@@ -120,7 +129,9 @@ config:
 
 Provider ids that point at the same server must share a lane (`lane:`),
 otherwise they interleave on its single slot. A shared lane takes its
-settings from the first provider listed for it.
+settings from the provider it is named for (`my-llamacpp` above). If that
+provider is not listed itself, it still runs on the lane, and the lane takes
+its settings from the first of its other providers by name.
 
 - The names are your dsh provider ids (the `provider` in your model routes).
 - An agent's lane is the provider its last model request used. Before its

@@ -122,6 +122,12 @@ interface Waiter {
 
 class ConcurrencyGate {
   private readonly active = new Set<object>()
+  /**
+   * Keys admitted over the limit (baton mode, nested delegation). The baton
+   * already keeps them from generating alongside anyone, so they do not count
+   * against the limit: counting them would starve queued root delegations.
+   */
+  private readonly forced = new Set<object>()
   private readonly waiters: Waiter[] = []
   private readonly limit: () => number
   private closed = false
@@ -132,7 +138,12 @@ class ConcurrencyGate {
 
   /** Admit waiters a raised limit now has room for. */
   pump(): void {
-    while (!this.closed && this.waiters.length > 0 && this.active.size < this.limit()) this.admitNext()
+    while (!this.closed && this.waiters.length > 0 && this.hasRoom()) this.admitNext()
+  }
+
+  /** Whether one more key fits under the limit, not counting forced keys. */
+  private hasRoom(): boolean {
+    return this.active.size - this.forced.size < this.limit()
   }
 
   async enter(key: object, signal: AbortSignal, timeoutMs: number): Promise<void> {
@@ -140,7 +151,7 @@ class ConcurrencyGate {
     signal.throwIfAborted()
     if (this.closed) throw new Error('subagent concurrency limit is disposed')
 
-    if (this.active.size < this.limit() && this.waiters.length === 0) {
+    if (this.hasRoom() && this.waiters.length === 0) {
       this.active.add(key)
       return
     }
@@ -183,7 +194,7 @@ class ConcurrencyGate {
     if (this.active.has(key)) return true
     signal.throwIfAborted()
     if (this.closed) throw new Error('subagent concurrency limit is disposed')
-    if (this.waiters.length > 0 || this.active.size >= this.limit()) return false
+    if (this.waiters.length > 0 || !this.hasRoom()) return false
     this.active.add(key)
     return true
   }
@@ -191,11 +202,14 @@ class ConcurrencyGate {
   /** Admit over the limit. Baton mode uses it for nested delegation, which cannot add a generator. */
   forceEnter(key: object): void {
     if (this.closed) throw new Error('subagent concurrency limit is disposed')
+    if (this.active.has(key)) return
     this.active.add(key)
+    this.forced.add(key)
   }
 
   release(key: object): void {
     if (!this.active.delete(key)) return
+    this.forced.delete(key)
     // Only admit while under the limit: forced admissions or a lowered limit
     // can leave the pool above it.
     this.pump()
@@ -205,6 +219,7 @@ class ConcurrencyGate {
     if (this.closed) return
     this.closed = true
     this.active.clear()
+    this.forced.clear()
     const error = new Error('subagent concurrency limit is disposed')
     for (const waiter of this.waiters.splice(0)) {
       waiter.signal.removeEventListener('abort', waiter.abort)
@@ -264,6 +279,12 @@ class Baton {
   private readonly toolSince = new Map<string, number>()
   private readonly depths = new Map<string, number>()
   private readonly parents = new Map<string, string>()
+  /** Order in which each agent first asked for the baton (see `clock`). */
+  private readonly firstSeen = new Map<string, number>()
+  /** Order in which each agent's current run of tool calls began. */
+  private readonly toolOrder = new Map<string, number>()
+  /** A counter ordering first asks against tool starts; clock times can tie. */
+  private clock = 0
   private readonly lendAfterMs: () => number
   private readonly projectOf: (id: string) => string | undefined
   private readonly projectPriorityMs: () => number
@@ -286,10 +307,12 @@ class Baton {
     signal.throwIfAborted()
     if (this.closed) throw new Error('subagent baton is disposed')
     this.depths.set(id, depth)
+    if (!this.firstSeen.has(id)) this.firstSeen.set(id, ++this.clock)
     // A step runs only after the previous step's tool calls settled, so any
     // tool count left here is a leak; clearing it keeps lending honest.
     this.inTools.delete(id)
     this.toolSince.delete(id)
+    this.toolOrder.delete(id)
     if (this.owner === id) return
     if (this.owner === undefined) {
       this.owner = id
@@ -319,11 +342,17 @@ class Baton {
     })
   }
 
-  /** The parent's delegation published a local child: the baton follows it. */
+  /**
+   * The parent's delegation published a local child: the baton follows it.
+   * A publish can land after the delegating call returned (background jobs),
+   * while the parent generates its next step. The baton then stays with the
+   * parent; the child, now a known descendant, borrows it as soon as the
+   * parent enters a tool, or takes it when the parent goes idle.
+   */
   handoff(parent: string, child: string): void {
     if (parent === child || this.closed) return
     this.parents.set(child, parent)
-    if (this.owner === parent) {
+    if (this.owner === parent && this.busyInTools(parent)) {
       this.suspended.push(parent)
       this.lenders.delete(parent)
       this.owner = child
@@ -340,7 +369,10 @@ class Baton {
 
   toolStart(id: string): void {
     const count = this.inTools.get(id) ?? 0
-    if (count === 0) this.toolSince.set(id, Date.now())
+    if (count === 0) {
+      this.toolSince.set(id, Date.now())
+      this.toolOrder.set(id, ++this.clock)
+    }
     this.inTools.set(id, count + 1)
     if (this.owner === id) this.settle()
   }
@@ -352,6 +384,7 @@ class Baton {
     } else {
       this.inTools.delete(id)
       this.toolSince.delete(id)
+      this.toolOrder.delete(id)
     }
   }
 
@@ -381,7 +414,9 @@ class Baton {
     }
     this.inTools.delete(id)
     this.toolSince.delete(id)
+    this.toolOrder.delete(id)
     this.depths.delete(id)
+    this.firstSeen.delete(id)
     this.parents.delete(id)
     this.release(id)
   }
@@ -415,8 +450,11 @@ class Baton {
     return (this.inTools.get(id) ?? 0) > 0
   }
 
-  /** Whether `id` descends from `ancestor`: by recorded handoffs, else by depth. */
-  private descendsFrom(id: string, ancestor: string): boolean {
+  /**
+   * Walk `id`'s recorded parents. Returns true when `ancestor` is on the
+   * chain, else the topmost agent reached (one with no recorded parent).
+   */
+  private chainTop(id: string, ancestor: string): true | string {
     let current = id
     for (let hops = 0; hops < 64; hops++) {
       const parent = this.parents.get(current)
@@ -424,9 +462,38 @@ class Baton {
       if (parent === undefined) break
       current = parent
     }
-    const depth = this.depths.get(current)
+    return current
+  }
+
+  /** Whether `id` descends from `ancestor`: by recorded handoffs, else by depth. */
+  private descendsFrom(id: string, ancestor: string): boolean {
+    const top = this.chainTop(id, ancestor)
+    if (top === true) return true
+    const depth = this.depths.get(top)
     const ancestorDepth = this.depths.get(ancestor)
     return depth !== undefined && ancestorDepth !== undefined && depth > ancestorDepth
+  }
+
+  /**
+   * Whether the owner may be waiting on `id`, so `id` borrows at once. A
+   * recorded handoff chain counts. Without one (a child published outside the
+   * delegating call's context, such as a workflow agent), a deeper agent counts
+   * only if it is not of another project and first showed up during the
+   * owner's current tool call: an older or unrelated deeper agent (a resumed
+   * session, a continuable child woken later) waits for lendAfterMs like anyone.
+   */
+  private awaitedBy(id: string, owner: string): boolean {
+    const top = this.chainTop(id, owner)
+    if (top === true) return true
+    const depth = this.depths.get(top)
+    const ownerDepth = this.depths.get(owner)
+    if (depth === undefined || ownerDepth === undefined || depth <= ownerDepth) return false
+    const project = this.projectOf(id)
+    const ownerProject = this.projectOf(owner)
+    if (project !== undefined && ownerProject !== undefined && project !== ownerProject) return false
+    const since = this.toolOrder.get(owner)
+    const seen = this.firstSeen.get(id)
+    return since !== undefined && seen !== undefined && seen > since
   }
 
   /** How long the current owner has been inside tool calls, or undefined when it is not. */
@@ -442,7 +509,7 @@ class Baton {
     // A parent that handed the baton to its child waits for it. A lender may
     // take the baton back like anyone else, unless it is the owner's ancestor.
     if (this.suspended.includes(id) && (!this.lenders.has(id) || this.isAncestorOf(id, owner))) return false
-    return this.descendsFrom(id, owner) || toolTime >= this.lendAfterMs()
+    return this.awaitedBy(id, owner) || toolTime >= this.lendAfterMs()
   }
 
   /** Whether `id` is an ancestor of `agent`. Agents of different projects never are. */
@@ -768,6 +835,22 @@ function projectKey(cwd: string): string {
   return cwd.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
 }
 
+/**
+ * The settings that govern a lane: the lane root's own entry (the provider the
+ * lane is named for, which the settings page edits) when it is listed, else
+ * the first follower by name, so the result never depends on key order.
+ */
+function laneSettings(listed: Readonly<Record<string, ProviderConfig>>, lane: string): ProviderConfig | undefined {
+  if (Object.hasOwn(listed, lane)) {
+    const root = listed[lane]
+    if (root.lane === undefined || root.lane === lane) return root
+  }
+  const followers = Object.keys(listed)
+    .filter((name) => (listed[name].lane ?? name) === lane)
+    .sort()
+  return followers.length > 0 ? listed[followers[0]] : undefined
+}
+
 /** The key of the single lane used while no providers are listed. */
 const GLOBAL_LANE = '*'
 
@@ -799,18 +882,17 @@ export function apply(ctx: Context, config: Config = {}): void {
     const listed = settings.providers()
     let key: string | undefined = GLOBAL_LANE
     if (Object.keys(listed).length > 0) {
-      const entry = provider === undefined ? undefined : listed[provider]
-      if (entry === undefined) return undefined
-      key = `lane:${entry.lane ?? provider}`
+      if (provider === undefined) return undefined
+      const entry = Object.hasOwn(listed, provider) ? listed[provider] : undefined
+      // A provider another entry names as its lane runs on that lane even
+      // when it is not listed itself: it is the server the lane stands for.
+      if (entry === undefined && !Object.values(listed).some((other) => other.lane === provider)) return undefined
+      key = `lane:${entry?.lane ?? provider}`
     }
     let lane = lanes.get(key)
     if (lane === undefined) {
-      const laneKey = key
-      // A shared lane takes its settings from the first provider listed for it.
-      const own = () =>
-        laneKey === GLOBAL_LANE
-          ? undefined
-          : Object.entries(settings.providers()).find(([name, entry]) => `lane:${entry.lane ?? name}` === laneKey)?.[1]
+      const laneName = key.slice('lane:'.length)
+      const own = () => (key === GLOBAL_LANE ? undefined : laneSettings(settings.providers(), laneName))
       lane = new Lane(
         key,
         () => own()?.baton ?? settings.baton(),
@@ -826,13 +908,17 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   function providerOf(agent: { readonly id: unknown; readonly options?: unknown; readonly session?: unknown }) {
     const id = String(agent.id)
-    const fromOptions = (agent.options as { provider?: unknown } | undefined)?.provider
-    return (
-      selectedProvider(agent.session) ??
-      observedProvider.get(id) ??
-      expectedProvider.get(id) ??
-      (typeof fromOptions === 'string' ? fromOptions : undefined)
-    )
+    const raw = (agent.options as { provider?: unknown } | undefined)?.provider
+    const fromOptions = typeof raw === 'string' && raw.length > 0 ? raw : undefined
+    // A fresh child's session log is seeded from its parent, so before the
+    // child's own first request the log names the parent's provider. Trust
+    // the delegation's provider until then.
+    if (!observedProvider.has(id)) {
+      const expected = expectedProvider.get(id)
+      if (expected !== undefined) return expected
+      if (fromOptions !== undefined && delegationDepthOf(agent as never) > 0) return fromOptions
+    }
+    return selectedProvider(agent.session) ?? observedProvider.get(id) ?? fromOptions
   }
 
   function enterKey(gate: ConcurrencyGate, key: object): void {
@@ -997,14 +1083,18 @@ export function apply(ctx: Context, config: Config = {}): void {
 
     let failed = false
     try {
-      return await startContext.run(reservation, next)
+      const result = await startContext.run(reservation, next)
+      // dsh-tools turns a failed or cancelled tool body into an `isError`
+      // result instead of throwing, so check the result too.
+      if ((result as { isError?: unknown } | undefined)?.isError === true) failed = true
+      return result
     } catch (error) {
       failed = true
       throw error
     } finally {
-      // An error publishes no run, so release. On success keep the reservation
-      // open: a deferred `subagent/start` (jobs publishes after the tool
-      // returns) binds it, and if none ever comes the parent's disposal
+      // A failed call publishes no run, so release. On success keep the
+      // reservation open: a deferred `subagent/start` (jobs publishes after the
+      // tool returns) binds it, and if none ever comes the parent's disposal
       // releases it below.
       if (failed && reservation.state === 'open') {
         gate.release(reservation)
@@ -1101,10 +1191,14 @@ export function apply(ctx: Context, config: Config = {}): void {
         if (!gate.tryEnter(lease, info.signal)) {
           throw new Error('subagent concurrency limit reservation was lost')
         }
+      } else if (run !== undefined && delegationDepthOf(info.agent) === 1) {
+        // A root agent's child with no reservation: a later turn, or a child
+        // of a tool outside subagentToolNames (subagent_fork, workflow). Its
+        // parent holds no permit, so it queues like a root delegation would.
+        await gate.enter(lease, info.signal, settings.queueTimeoutMs())
       } else if (run !== undefined) {
-        // A later turn of a run, or a publish whose async context lost the
-        // tool call's store. Never queue: fail loudly when the pool is full,
-        // so the child cannot block the ancestor waiting for it.
+        // A deeper child with no reservation. Never queue: fail loudly when the
+        // pool is full, so the child cannot block the ancestor waiting for it.
         if (!gate.tryEnter(lease, info.signal)) {
           throw new Error('subagent concurrency limit exhausted for reservation-less local child turn')
         }

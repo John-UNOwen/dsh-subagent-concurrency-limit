@@ -99,7 +99,7 @@ function apply(loaded: { exports: Record<string, unknown> }, catalog: unknown = 
   const ctx = {
     effect: (fn: () => unknown) => fn(),
     inject: (names: string[], fn: (scope: unknown) => void) => {
-      if (catalog === undefined || !names.includes('remote.session')) return
+      if (catalog == null || !names.includes('remote.session')) return
       const remote = { session: { modelCatalog: () => Promise.resolve(catalog) } }
       // Like cordis: reading a service the scope did not inject throws.
       fn({
@@ -296,6 +296,51 @@ describe('client provider list', () => {
     })
     assert.strictEqual(switches.length, 3)
     assert.ok(switches.every((el) => el.props?.checked === false))
+  })
+
+  it('round-trips provider names with spaces and separators (#9)', () => {
+    const l = lanes()
+    const map: Lanes = { 'my gpu': { lane: 'a:b' }, 'a:b': { maxConcurrentSubagents: 2 }, 'x;y': { lane: 'my gpu' } }
+    assert.deepStrictEqual(plain(l.parseLanes(l.formatLanes(map))), map)
+    // Picking a spaced name in "Shares a server with" keeps the draft valid.
+    const shared = l.withLane(l.withProvider({}, 'my gpu'), 'other', 'my gpu')
+    assert.deepStrictEqual(plain(l.parseLanes(l.formatLanes(shared))), { 'my gpu': {}, other: { lane: 'my gpu' } })
+    // Unquoted text parses as before.
+    assert.deepStrictEqual(plain(l.parseLanes('a: limit=3; b: lane=a')), {
+      a: { maxConcurrentSubagents: 3 },
+      b: { lane: 'a' },
+    })
+    assert.strictEqual(l.parseLanes('a: lane="unterminated'), undefined)
+  })
+
+  it('says the provider list is unavailable instead of loading forever (#10)', () => {
+    const { loaded } = loadClient()
+    const { registrations } = apply(loaded, null)
+    const card = registrations[0]?.component
+    assert.ok(card)
+    const form = card({ t: (key: string) => key, view: 'page' }) as Element
+    const find = (node: unknown): Element | undefined => {
+      if (node === null || typeof node !== 'object') return undefined
+      if (Array.isArray(node)) {
+        for (const child of node) {
+          const hit = find(child)
+          if (hit) return hit
+        }
+        return undefined
+      }
+      const el = node as Element
+      if (typeof el.type === 'function' && el.props?.text !== undefined) return el
+      for (const child of el.children ?? []) {
+        const hit = find(child)
+        if (hit) return hit
+      }
+      return undefined
+    }
+    const providers = find(form)
+    assert.ok(providers)
+    const text = JSON.stringify((providers.type as (props: unknown) => unknown)(providers.props))
+    assert.ok(text.includes('catalogUnavailable'), text)
+    assert.ok(!text.includes('catalogLoading'), text)
   })
 
   it('keeps working without a model catalog', () => {
