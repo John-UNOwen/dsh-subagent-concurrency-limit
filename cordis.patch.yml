@@ -1,5 +1,8 @@
 # Fork default: baton mode for single-slot local LLM servers.
 # Only one agent (root included) generates at a time; a parent pauses while its child runs.
+# The pause row keeps the list of paused workspaces in its own settings entry,
+# so pausing from the settings page or a chat never disturbs unsaved edits on
+# the main settings form.
 - insert:
     - id: subagent-concurrency-limit
       name: dsh-subagent-concurrency-limit
@@ -8,3 +11,5 @@
         maxConcurrentSubagents: 4
         subagentToolNames:
           - subagent
+    - id: subagent-concurrency-pause
+      name: './lib/pause.js'

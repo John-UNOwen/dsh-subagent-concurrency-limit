@@ -10,7 +10,8 @@
     "sourceMap": true,
     "declarationMap": true,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": ["node"],
+    "rewriteRelativeImportExtensions": true
   },
   "include": ["src"]
 }

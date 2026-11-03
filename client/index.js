@@ -65,6 +65,32 @@ window.__ModuleLoader__.load({
       saveFailed: 'The save was not accepted.',
       save: 'Save',
       saving: 'Saving…',
+      workspacesTitle: 'Workspaces',
+      workspacesIntro:
+        'Pause a workspace (working folder) so another can use the model. Its agents stop before their next model request; a request or tool call already under way finishes first. Resuming puts it back in the queue behind agents already waiting. The switches apply at once, without Save.',
+      pauseWorkspaceLabel: 'Pause {path}',
+      statePaused: 'Paused',
+      statePausing: 'Pausing',
+      stateRunning: 'Running',
+      stateIdle: 'Idle',
+      oneAgent: '1 agent',
+      manyAgents: '{n} agents',
+      partHeld: '{agents} held',
+      partFinishing: '{agents} finishing a step',
+      partBaton: 'holds the baton',
+      partWaiting: '{agents} waiting for the baton',
+      workspacesLoading: 'Loading workspaces…',
+      workspacesEmpty: 'No workspaces yet. A workspace shows here once a chat in its folder has started.',
+      workspacesError: 'Could not load the workspace list.',
+      workspacesUnavailable: 'The workspace list is not available here.',
+      pauseUnavailable:
+        'Pausing is not available: the profile does not run the subagent-concurrency-pause entry. Update or reinstall the plugin so its bundle patch adds it.',
+      pauseReadOnly: 'Settings are read-only in this deployment, so workspaces cannot be paused here.',
+      pauseFailed: 'The change was not saved.',
+      pauseWorkspace: 'Pause workspace',
+      resumeWorkspace: 'Resume workspace',
+      pauseWorkspaceHint: 'Pause this chat’s workspace ({path}) so another workspace can use the model.',
+      resumeWorkspaceHint: '{path} is paused. Resuming puts it back in the queue.',
     }
     var zh = {
       summary: '限制子代理并发；接力棒模式下同一时间只有一个代理在生成。',
@@ -112,6 +138,32 @@ window.__ModuleLoader__.load({
       saveFailed: '保存未被接受。',
       save: '保存',
       saving: '保存中…',
+      workspacesTitle: '工作区',
+      workspacesIntro:
+        '暂停一个工作区（工作目录），让其他工作区使用模型。它的代理会在下一次模型请求前停下；已在进行的请求或工具调用会先完成。恢复后它会排到已在等待的代理之后。开关立即生效，无需保存。',
+      pauseWorkspaceLabel: '暂停 {path}',
+      statePaused: '已暂停',
+      statePausing: '正在暂停',
+      stateRunning: '运行中',
+      stateIdle: '空闲',
+      oneAgent: '1 个代理',
+      manyAgents: '{n} 个代理',
+      partHeld: '{agents}已停下',
+      partFinishing: '{agents}正在完成当前步骤',
+      partBaton: '持有接力棒',
+      partWaiting: '{agents}在等待接力棒',
+      workspacesLoading: '正在加载工作区…',
+      workspacesEmpty: '暂无工作区。某个目录中的对话开始后，它的工作区会显示在这里。',
+      workspacesError: '无法加载工作区列表。',
+      workspacesUnavailable: '此处无法获取工作区列表。',
+      pauseUnavailable:
+        '无法暂停：当前配置未运行 subagent-concurrency-pause 条目。请更新或重新安装插件，由其捆绑补丁添加该条目。',
+      pauseReadOnly: '此部署的设置为只读，无法在此暂停工作区。',
+      pauseFailed: '更改未保存。',
+      pauseWorkspace: '暂停工作区',
+      resumeWorkspace: '恢复工作区',
+      pauseWorkspaceHint: '暂停此对话的工作区（{path}），让其他工作区使用模型。',
+      resumeWorkspaceHint: '{path} 已暂停。恢复后它会重新排队。',
     }
 
     function booleanField(field) {
@@ -180,7 +232,7 @@ window.__ModuleLoader__.load({
         if (text[i] === '\\') i++
         else if (text[i] === '"') {
           try {
-            let value = JSON.parse(text.slice(start, i + 1))
+            const value = JSON.parse(text.slice(start, i + 1))
             return typeof value === 'string' ? [value, i + 1] : undefined
           } catch {
             return undefined
@@ -201,14 +253,14 @@ window.__ModuleLoader__.load({
         // The name: a JSON string, or plain text up to ':' or the entry's end.
         let name
         if (text[i] === '"') {
-          let quoted = readQuoted(text, i)
+          const quoted = readQuoted(text, i)
           if (quoted === undefined) return undefined
           name = quoted[0]
           i = quoted[1]
           while (isSpace(text[i])) i++
           if (text[i] !== ':' && !isEnd(text[i])) return undefined
         } else {
-          let from = i
+          const from = i
           while (!isEnd(text[i]) && text[i] !== ':') i++
           name = text.slice(from, i).trim()
         }
@@ -218,18 +270,18 @@ window.__ModuleLoader__.load({
         for (;;) {
           while (isSpace(text[i])) i++
           if (isEnd(text[i])) break
-          let match = /^(lane|baton|limit|lend)=/.exec(text.slice(i))
+          const match = /^(lane|baton|limit|lend)=/.exec(text.slice(i))
           if (match === null) return undefined
           i += match[0].length
           let raw
           if (text[i] === '"') {
-            let value = readQuoted(text, i)
+            const value = readQuoted(text, i)
             if (value === undefined) return undefined
             raw = value[0]
             i = value[1]
             if (!isSpace(text[i]) && !isEnd(text[i])) return undefined
           } else {
-            let begin = i
+            const begin = i
             while (!isSpace(text[i]) && !isEnd(text[i])) i++
             raw = text.slice(begin, i)
           }
@@ -493,7 +545,423 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function createCard(react, ui, store, actions, catalog) {
+    // ---- Workspaces: pause one so another can use the model ----
+
+    // The pause row's profile entry id and settings namespace. Keeping the
+    // paused list there means an instant pause never moves the main entry's
+    // revision, so it cannot invalidate unsaved edits on the main form.
+    var PAUSE_ENTRY_ID = 'subagent-concurrency-pause'
+    // The host half's read-only route (CHANNEL in src/index.ts).
+    var CHANNEL = '/subagent-concurrency-limit'
+    var WORKSPACES_REFRESH_MS = 3000
+    var ROUTE_TIMEOUT_MS = 15000
+    var LOOKUP_RETRY_MS = 5000
+
+    /** A folder's workspace key, matched the way the host half matches it. */
+    function projectKey(path) {
+      return String(path).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+    }
+
+    /** The paused folders in a pause-form snapshot. */
+    function pausedList(snapshot) {
+      var value = snapshot ? snapshot.value : undefined
+      var list = value ? value.pausedWorkspaces : undefined
+      return Array.isArray(list) ? list.filter((path) => typeof path === 'string' && path.length > 0) : []
+    }
+
+    /** The paused list with `path`'s workspace added or removed; undefined when nothing changes. */
+    function withPaused(list, path, paused) {
+      var key = projectKey(path)
+      var listed = list.some((entry) => projectKey(entry) === key)
+      if (paused) return listed ? undefined : list.concat([path])
+      return listed ? list.filter((entry) => projectKey(entry) !== key) : undefined
+    }
+
+    /** The host route, callable while the connection service is up. */
+    function createRoute() {
+      var listeners = new Set()
+      var route = {
+        call: undefined,
+        subscribe: (listener) => {
+          listeners.add(listener)
+          return () => listeners.delete(listener)
+        },
+        set: (call) => {
+          route.call = call
+          for (var listener of listeners) listener()
+        },
+        /** @returns the endpoint's result, or undefined without a connection; rejects on transport failure. */
+        request: (endpoint, payload) => {
+          var call = route.call
+          if (call === undefined) return Promise.resolve(undefined)
+          var timer
+          var timeout = new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('the workspace route timed out')), ROUTE_TIMEOUT_MS)
+          })
+          return Promise.race([Promise.resolve().then(() => call(endpoint, payload)), timeout]).finally(() =>
+            clearTimeout(timer),
+          )
+        },
+      }
+      return route
+    }
+
+    /** The route's workspace list, refreshed while the settings page shows it. */
+    function createWorkspaceList(route) {
+      var listeners = new Set()
+      var snapshot = { status: 'idle', rows: [], message: '' }
+      var timer
+      var generation = 0
+      var set = (next) => {
+        snapshot = next
+        for (var listener of listeners) listener()
+      }
+      var stop = () => {
+        clearTimeout(timer)
+        timer = undefined
+      }
+      var list = {
+        subscribe: (listener) => {
+          listeners.add(listener)
+          if (listeners.size === 1) list.refresh()
+          return () => {
+            listeners.delete(listener)
+            if (listeners.size === 0) {
+              generation++
+              stop()
+            }
+          }
+        },
+        getSnapshot: () => snapshot,
+        listening: () => listeners.size > 0,
+        refresh: () => {
+          var mine = ++generation
+          stop()
+          if (route.call === undefined) {
+            set({ status: 'unavailable', rows: snapshot.rows, message: '' })
+            return
+          }
+          if (snapshot.status !== 'ready' && snapshot.status !== 'loading')
+            set({ status: 'loading', rows: snapshot.rows, message: '' })
+          var settle = (next) => {
+            if (mine !== generation) return
+            set(next)
+            if (listeners.size > 0) timer = setTimeout(list.refresh, WORKSPACES_REFRESH_MS)
+          }
+          route.request('workspaces', {}).then(
+            (result) => {
+              var value = result?.ok ? result.value : undefined
+              if (value && Array.isArray(value.workspaces))
+                settle({ status: 'ready', rows: value.workspaces, message: '' })
+              else
+                settle({
+                  status: 'error',
+                  rows: snapshot.rows,
+                  message: String(result?.error?.message ?? result?.error ?? ''),
+                })
+            },
+            (error) => settle({ status: 'error', rows: snapshot.rows, message: String(error?.message ?? error) }),
+          )
+        },
+      }
+      route.subscribe(() => {
+        if (listeners.size > 0) list.refresh()
+      })
+      return list
+    }
+
+    /**
+     * Pause and resume through the pause row's settings entry. Changes run one
+     * at a time, each computing its list from the one the previous change
+     * left, and a change the Host refused is retried once after its recovery
+     * read. Until a change settles, its workspace shows the state it asked for.
+     */
+    function createPauseControl(form, onSettled) {
+      var listeners = new Set()
+      var pending = new Map()
+      var failed = new Set()
+      var tail = Promise.resolve()
+      var serial = 0
+      var version = 0
+      var memo
+      var notify = () => {
+        version++
+        for (var listener of listeners) listener()
+      }
+      var write = (path, paused, retried) => {
+        var current = form.getSnapshot()
+        if (current.status !== 'ready' || !current.writable) return Promise.resolve(false)
+        var next = withPaused(pausedList(current), path, paused)
+        if (next === undefined) return Promise.resolve(true)
+        return form.set('pausedWorkspaces', next).then((ok) => (ok || retried ? ok : write(path, paused, true)))
+      }
+      var control = {
+        subscribe: (listener) => {
+          listeners.add(listener)
+          var off = form.subscribe(listener)
+          return () => {
+            listeners.delete(listener)
+            off()
+          }
+        },
+        getSnapshot: () => {
+          var current = form.getSnapshot()
+          if (memo === undefined || memo.form !== current || memo.version !== version) {
+            const paused = pausedList(current)
+            const asked = new Map()
+            for (const [key, change] of pending) asked.set(key, change.paused)
+            memo = {
+              form: current,
+              version: version,
+              writable: current.status === 'ready' && current.writable === true,
+              paused: paused,
+              keys: new Set(paused.map(projectKey)),
+              pending: asked,
+              failed: new Set(failed),
+            }
+          }
+          return memo
+        },
+        /** Whether a workspace is paused, counting a change still on its way. */
+        isPaused: (snapshot, key) => (snapshot.pending.has(key) ? snapshot.pending.get(key) : snapshot.keys.has(key)),
+        toggle: (path, paused) => {
+          var key = projectKey(path)
+          var mine = ++serial
+          pending.set(key, { paused: paused, serial: mine })
+          failed.delete(key)
+          notify()
+          var run = tail.then(() => write(path, paused, false))
+          tail = run.then(
+            () => undefined,
+            () => undefined,
+          )
+          return run
+            .catch(() => false)
+            .then((ok) => {
+              if (pending.get(key)?.serial === mine) pending.delete(key)
+              if (!ok) failed.add(key)
+              notify()
+              if (onSettled) onSettled()
+              return ok
+            })
+        },
+      }
+      return control
+    }
+
+    /** Each chat's workspace, looked up once through the route. */
+    function createWorkspaceLookup(route) {
+      var listeners = new Set()
+      var found = new Map()
+      var set = (sessionId, entry) => {
+        found = new Map(found)
+        found.set(sessionId, entry)
+        for (var listener of listeners) listener()
+      }
+      var lookup = {
+        subscribe: (listener) => {
+          listeners.add(listener)
+          return () => listeners.delete(listener)
+        },
+        getSnapshot: () => found,
+        want: (sessionId) => {
+          if (typeof sessionId !== 'string' || sessionId.length === 0 || route.call === undefined) return
+          var known = found.get(sessionId)
+          if (known !== undefined && known.status !== 'missing') return
+          if (known !== undefined && Date.now() - known.at < LOOKUP_RETRY_MS) return
+          set(sessionId, { status: 'loading' })
+          var missing = () => set(sessionId, { status: 'missing', at: Date.now() })
+          route.request('workspaceOf', { sessionId: sessionId }).then((result) => {
+            var value = result?.ok ? result.value : undefined
+            if (value && typeof value.key === 'string' && typeof value.path === 'string')
+              set(sessionId, { status: 'ready', workspace: { key: value.key, path: value.path } })
+            else missing()
+          }, missing)
+        },
+      }
+      return lookup
+    }
+
+    /** The settings page's workspaces: the route's list plus paused folders it has not reported. */
+    function mergeWorkspaces(rows, paused) {
+      var byKey = new Map()
+      for (var row of rows) {
+        if (row && typeof row.key === 'string' && typeof row.path === 'string') byKey.set(row.key, row)
+      }
+      for (var path of paused) {
+        const key = projectKey(path)
+        if (!byKey.has(key))
+          byKey.set(key, { key: key, path: path, running: 0, held: 0, waiting: 0, holdsBaton: false })
+      }
+      return [...byKey.values()].sort((a, b) => a.path.localeCompare(b.path))
+    }
+
+    function agentCount(t, n) {
+      return n === 1 ? t('oneAgent') : t('manyAgents', { n: n })
+    }
+
+    /** The line under a workspace: what its agents are doing. */
+    function workspaceStatus(t, row, paused) {
+      var running = row.running || 0
+      var held = row.held || 0
+      var waiting = row.waiting || 0
+      var parts = []
+      if (paused) {
+        // Held agents wait at the gate; the others are finishing the step they were in.
+        const finishing = Math.max(0, running - held)
+        parts.push(held === 0 && finishing > 0 ? t('statePausing') : t('statePaused'))
+        if (held > 0) parts.push(t('partHeld', { agents: agentCount(t, held) }))
+        if (finishing > 0) parts.push(t('partFinishing', { agents: agentCount(t, finishing) }))
+      } else {
+        parts.push(running > 0 || row.holdsBaton || waiting > 0 ? t('stateRunning') : t('stateIdle'))
+        if (running > 0) parts.push(agentCount(t, running))
+        if (row.holdsBaton) parts.push(t('partBaton'))
+        if (waiting > 0) parts.push(t('partWaiting', { agents: agentCount(t, waiting) }))
+      }
+      return parts.join(' · ')
+    }
+
+    function WorkspacesEditor(react, ui, list, control) {
+      var h = react.createElement
+      var hint = { margin: 0, fontSize: '12px', lineHeight: 1.5, color: 'var(--dsw-alias-label-tertiary)' }
+      var row = {
+        display: 'grid',
+        gridTemplateColumns: 'minmax(0,1fr) auto',
+        gap: '4px 16px',
+        alignItems: 'center',
+        padding: '10px 0',
+        borderTop: '0.5px solid var(--dsw-alias-border-l3)',
+      }
+      var path = { fontSize: '13px', color: 'var(--dsw-alias-label-primary)', overflowWrap: 'anywhere' }
+      var error = Object.assign({}, hint, { color: 'var(--dsw-alias-label-error, #d9534f)' })
+      var link = {
+        background: 'none',
+        border: 0,
+        padding: 0,
+        cursor: 'pointer',
+        fontSize: '12px',
+        color: 'var(--dsw-alias-brand-primary)',
+      }
+
+      return function Workspaces(props) {
+        var t = props.t
+        var listing = react.useSyncExternalStore(list.subscribe, list.getSnapshot)
+        var pause = react.useSyncExternalStore(control.subscribe, control.getSnapshot)
+        var form = pause.form
+        var rows = mergeWorkspaces(listing.rows, pause.paused)
+
+        var notice = null
+        if (form.mode === 'memory' || (form.status === 'ready' && !form.writable))
+          notice = h('p', { style: hint }, t('pauseReadOnly'))
+        else if (form.status === 'unavailable') notice = h('p', { style: hint }, t('pauseUnavailable'))
+
+        var status = null
+        if (listing.status === 'unavailable') status = h('p', { style: hint }, t('workspacesUnavailable'))
+        else if (listing.status === 'error')
+          status = h(
+            'p',
+            { style: hint },
+            `${t('workspacesError')} `,
+            h('button', { type: 'button', style: link, onClick: list.refresh }, t('refresh')),
+            listing.message ? h('span', { style: { display: 'block' } }, listing.message) : null,
+          )
+        else if (rows.length === 0)
+          status = h('p', { style: hint }, listing.status === 'ready' ? t('workspacesEmpty') : t('workspacesLoading'))
+
+        return h(
+          'div',
+          null,
+          h('p', { style: hint }, t('workspacesIntro')),
+          notice,
+          status,
+          rows.map((entry) => {
+            var paused = control.isPaused(pause, entry.key)
+            return h(
+              'div',
+              { key: entry.key, style: row },
+              h(
+                'div',
+                { style: { minWidth: 0 } },
+                h('div', { style: path }, entry.path),
+                h('div', { style: hint }, workspaceStatus(t, entry, paused)),
+                pause.failed.has(entry.key) ? h('div', { style: error }, t('pauseFailed')) : null,
+              ),
+              h(ui.Switch, {
+                checked: paused,
+                label: t('pauseWorkspaceLabel', { path: entry.path }),
+                disabled: !pause.writable || pause.pending.has(entry.key),
+                onChange: (next) => control.toggle(entry.path, next),
+              }),
+            )
+          }),
+        )
+      }
+    }
+
+    function PauseIcon(h, paused) {
+      return h(
+        'svg',
+        { viewBox: '0 0 16 16', width: 12, height: 12, fill: 'currentColor', 'aria-hidden': 'true' },
+        paused
+          ? h('path', { d: 'M4.5 3.2v9.6a.6.6 0 0 0 .9.5l7.6-4.8a.6.6 0 0 0 0-1L5.4 2.7a.6.6 0 0 0-.9.5z' })
+          : h('path', { d: 'M4.5 3h2v10h-2zM9.5 3h2v10h-2z' }),
+      )
+    }
+
+    /** The composer's "Pause workspace / Resume workspace" button for the open chat. */
+    function ComposerPause(react, lookup, control) {
+      var h = react.createElement
+      var wrap = { display: 'inline-flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }
+      var button = {
+        cursor: 'pointer',
+        border: '1px solid var(--dsw-alias-border-l2)',
+        borderRadius: '6px',
+        padding: '1px 8px',
+        fontSize: '12px',
+        lineHeight: '18px',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: '4px',
+      }
+      var idle = Object.assign({}, button, { background: 'transparent', color: 'var(--dsw-alias-label-secondary)' })
+      var active = Object.assign({}, button, {
+        background: 'var(--dsw-alias-state-business-primary)',
+        color: 'var(--dsw-alias-label-primary-inverted)',
+      })
+      var error = { fontSize: '12px', color: 'var(--dsw-alias-label-error, #d9534f)' }
+
+      return function SubagentConcurrencyPauseButton(props) {
+        var t = props.t
+        var sessionId = props.sessionId
+        var found = react.useSyncExternalStore(lookup.subscribe, lookup.getSnapshot)
+        var pause = react.useSyncExternalStore(control.subscribe, control.getSnapshot)
+        // After every render: a lookup that came back empty is retried later.
+        react.useEffect(() => lookup.want(sessionId))
+        var workspace = found.get(sessionId)?.workspace
+        if (workspace === undefined || !pause.writable) return null
+        var paused = control.isPaused(pause, workspace.key)
+        return h(
+          'span',
+          { style: wrap },
+          h(
+            'button',
+            {
+              type: 'button',
+              'aria-pressed': paused,
+              title: t(paused ? 'resumeWorkspaceHint' : 'pauseWorkspaceHint', { path: workspace.path }),
+              disabled: pause.pending.has(workspace.key),
+              style: paused ? active : idle,
+              onClick: () => control.toggle(workspace.path, !paused),
+            },
+            PauseIcon(h, paused),
+            t(paused ? 'resumeWorkspace' : 'pauseWorkspace'),
+          ),
+          pause.failed.has(workspace.key) ? h('span', { style: error }, t('pauseFailed')) : null,
+        )
+      }
+    }
+
+    function createCard(react, ui, store, actions, catalog, Workspaces) {
       var Providers = ProvidersEditor(react, ui, catalog, actions)
       var h = react.createElement
       var section = { padding: '16px 0', display: 'grid', gap: '12px', minWidth: 0 }
@@ -564,6 +1032,8 @@ window.__ModuleLoader__.load({
             onSave: actions.save,
             onDiscard: actions.discard,
           },
+          // Pausing writes its own entry at once; it is not part of this form's Save.
+          h('section', { style: section }, h('h3', { style: heading }, t('workspacesTitle')), h(Workspaces, { t: t })),
           h(
             'section',
             { style: section },
@@ -718,7 +1188,19 @@ window.__ModuleLoader__.load({
           'subagent-concurrency-limit: catalog',
         )
       })
-      var Card = createCard(react, ui, store, form.actions(), catalog)
+      var route = createRoute()
+      var list = createWorkspaceList(route)
+      var control = createPauseControl(ctx.configForms.get(PAUSE_ENTRY_ID), () => {
+        if (list.listening()) list.refresh()
+      })
+      var lookup = createWorkspaceLookup(route)
+      // The workspace route rides the connection; without it the page lists
+      // only the paused folders and the composer shows no button.
+      ctx.inject(['connection'], (scope) => {
+        route.set((endpoint, payload) => scope.connection.rpc.call(CHANNEL, endpoint, payload))
+        scope.effect(() => () => route.set(undefined), 'subagent-concurrency-limit: workspace route')
+      })
+      var Card = createCard(react, ui, store, form.actions(), catalog, WorkspacesEditor(react, ui, list, control))
 
       // Registered only while the Host serves the entry, so a profile that
       // switched the bundle off shows no form.
@@ -731,6 +1213,19 @@ window.__ModuleLoader__.load({
           ),
         'subagent-concurrency-limit: settings page',
       )
+      var ComposerButton = ComposerPause(react, lookup, control)
+      ctx.effect(
+        () =>
+          ctx.configForms.whileServed([PAUSE_ENTRY_ID], () =>
+            ctx.slots.inject('conversation.input.right', () =>
+              ctx.slots.register(
+                { name: 'conversation.input.right', id: 'subagent-concurrency-pause', order: 31, locale: NS },
+                ComposerButton,
+              ),
+            ),
+          ),
+        'subagent-concurrency-limit: composer pause button',
+      )
     }
 
     module.exports.apply = apply
@@ -742,6 +1237,13 @@ window.__ModuleLoader__.load({
       nonNegativeIntegerField: nonNegativeIntegerField,
       nameListField: nameListField,
       lanesField: lanesField,
+    }
+    module.exports.__workspaces = {
+      projectKey: projectKey,
+      withPaused: withPaused,
+      mergeWorkspaces: mergeWorkspaces,
+      workspaceStatus: workspaceStatus,
+      createPauseControl: createPauseControl,
     }
     module.exports.__lanes = {
       parseLanes: parseLanes,

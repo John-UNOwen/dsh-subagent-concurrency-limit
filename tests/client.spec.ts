@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { describe, it } from 'node:test'
+import { afterEach, describe, it } from 'node:test'
 import vm from 'node:vm'
 
 /** Copy a value out of the vm realm so deepStrictEqual compares plain data. */
@@ -14,9 +14,16 @@ interface Element {
   children: unknown[]
 }
 
+/** Unsubscribes of every loaded client, run after each test even when it fails. */
+const releases: (() => void)[] = []
+afterEach(() => {
+  for (const release of releases.splice(0)) release()
+})
+
 /** Load the browser bundle with stand-ins for dsh's module loader, React, and UI primitives. */
 function loadClient() {
   const specs: { field: string }[] = []
+  const subscriptions: (() => void)[] = []
   const store = { subscribe: () => () => {}, getSnapshot: () => snapshot }
   const field = (text: string) => ({ text, overridden: false, invalid: false })
   const snapshot = {
@@ -57,8 +64,11 @@ function loadClient() {
       children,
     }),
     useSyncExternalStore: (subscribe: (listener: () => void) => () => void, get: () => unknown) => {
-      subscribe(() => {})
+      subscriptions.push(subscribe(() => {}))
       return get()
+    },
+    useEffect: (effect: () => unknown) => {
+      effect()
     },
   }
   let loaded: { id: string; exports: Record<string, unknown> } | undefined
@@ -78,7 +88,12 @@ function loadClient() {
     clearTimeout,
   })
   assert.ok(loaded)
-  return { loaded, specs }
+  /** Unsubscribe every render, as unmounting does; stops the workspace list's refresh. */
+  const release = () => {
+    for (const off of subscriptions.splice(0)) off()
+  }
+  releases.push(release)
+  return { loaded, specs, release }
 }
 
 const CATALOG = {
@@ -93,12 +108,23 @@ const CATALOG = {
   },
 }
 
-function apply(loaded: { exports: Record<string, unknown> }, catalog: unknown = CATALOG) {
+interface Extra {
+  /** The connection's rpc.call; omitted, the page has no connection. */
+  rpc?: (channel: string, endpoint: string, payload: unknown) => Promise<unknown>
+  /** The pause row's config form. */
+  pauseForm?: unknown
+}
+
+function apply(loaded: { exports: Record<string, unknown> }, catalog: unknown = CATALOG, extra: Extra = {}) {
   const registrations: { options: Record<string, unknown>; component: (props: unknown) => unknown }[] = []
   const namespaces: string[] = []
   const ctx = {
     effect: (fn: () => unknown) => fn(),
     inject: (names: string[], fn: (scope: unknown) => void) => {
+      if (names.includes('connection')) {
+        if (extra.rpc) fn({ effect: (inner: () => unknown) => inner(), connection: { rpc: { call: extra.rpc } } })
+        return
+      }
       if (catalog == null || !names.includes('remote.session')) return
       const remote = { session: { modelCatalog: () => Promise.resolve(catalog) } }
       // Like cordis: reading a service the scope did not inject throws.
@@ -114,7 +140,7 @@ function apply(loaded: { exports: Record<string, unknown> }, catalog: unknown = 
     configForms: {
       get: (id: string) => {
         namespaces.push(id)
-        return {}
+        return id === 'subagent-concurrency-pause' ? (extra.pauseForm ?? {}) : {}
       },
       whileServed: (ids: string[], register: () => () => void) => {
         namespaces.push(...ids)
@@ -139,11 +165,17 @@ describe('client settings page', () => {
     assert.strictEqual(loaded.id, 'dsh-subagent-concurrency-limit')
     assert.deepStrictEqual(plain(loaded.exports.inject), ['slots', 'locale', 'configForms'])
     const { registrations, namespaces } = apply(loaded)
-    assert.deepStrictEqual([...new Set(namespaces)], ['subagent-concurrency-limit'])
-    assert.strictEqual(registrations.length, 1)
+    assert.deepStrictEqual([...new Set(namespaces)], ['subagent-concurrency-limit', 'subagent-concurrency-pause'])
+    assert.strictEqual(registrations.length, 2)
     assert.deepStrictEqual(plain(registrations[0]?.options), {
       name: 'plugins.bundle.config',
       key: 'dsh-subagent-concurrency-limit',
+      locale: 'subagentConcurrencyLimit',
+    })
+    assert.deepStrictEqual(plain(registrations[1]?.options), {
+      name: 'conversation.input.right',
+      id: 'subagent-concurrency-pause',
+      order: 31,
       locale: 'subagentConcurrencyLimit',
     })
     assert.deepStrictEqual(
@@ -346,7 +378,7 @@ describe('client provider list', () => {
   it('keeps working without a model catalog', () => {
     const { loaded } = loadClient()
     const { registrations } = apply(loaded, undefined)
-    assert.strictEqual(registrations.length, 1)
+    assert.strictEqual(registrations.length, 2)
   })
 })
 
@@ -368,5 +400,308 @@ describe('client catalog loading', () => {
     card({ t: (key: string) => key, view: 'page' })
     // The card itself does not subscribe to the catalog; only the provider list does.
     assert.strictEqual(calls, 0)
+  })
+})
+
+/** Every element in a tree that passes `test`. */
+function findAll(node: unknown, test: (el: Element) => boolean, hits: Element[] = []): Element[] {
+  if (node === null || typeof node !== 'object') return hits
+  if (Array.isArray(node)) {
+    for (const child of node) findAll(child, test, hits)
+    return hits
+  }
+  const el = node as Element
+  if (el.type !== undefined && test(el)) hits.push(el)
+  for (const child of el.children ?? []) findAll(child, test, hits)
+  return hits
+}
+
+/** Call an element's event handler. */
+function fire(el: Element | undefined, handler: string, ...args: unknown[]): unknown {
+  const fn = el?.props?.[handler]
+  assert.ok(typeof fn === 'function', handler)
+  return (fn as (...values: unknown[]) => unknown)(...args)
+}
+
+/** Translate to the key, with params appended, so tests can read what was asked for. */
+const t = (key: string, params?: Record<string, unknown>) => (params ? `${key}${JSON.stringify(params)}` : key)
+const tick = () => new Promise((resolve) => setImmediate(resolve))
+
+/** A pause-row config form over an in-memory list, like dsh's ConfigForm. */
+function fakePauseForm(initial: string[], options: { refuse?: number; writable?: boolean; status?: string } = {}) {
+  let snapshot = {
+    status: options.status ?? 'ready',
+    writable: options.writable ?? true,
+    mode: 'host',
+    value: { pausedWorkspaces: initial },
+    revision: 1,
+  }
+  const listeners = new Set<() => void>()
+  const writes: unknown[] = []
+  let refusals = options.refuse ?? 0
+  const publish = (list: string[]) => {
+    snapshot = { ...snapshot, value: { pausedWorkspaces: list }, revision: snapshot.revision + 1 }
+    for (const listener of listeners) listener()
+  }
+  const form = {
+    getSnapshot: () => snapshot,
+    subscribe: (listener: () => void) => {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+    set: async (field: string, value: unknown) => {
+      assert.strictEqual(field, 'pausedWorkspaces')
+      writes.push(plain(value))
+      await tick()
+      if (refusals > 0) {
+        refusals--
+        // The recovery read finds a folder paused elsewhere meanwhile.
+        publish([...snapshot.value.pausedWorkspaces, 'D:\\Elsewhere'])
+        return false
+      }
+      publish(plain(value) as string[])
+      return true
+    },
+  }
+  return { form, writes, paused: () => snapshot.value.pausedWorkspaces }
+}
+
+const ROWS = [
+  { key: 'c:/work/a', path: 'C:\\Work\\A', paused: false, running: 2, held: 0, waiting: 1, holdsBaton: true },
+  { key: 'c:/work/b', path: 'C:\\Work\\B', paused: false, running: 0, held: 0, waiting: 0, holdsBaton: false },
+]
+
+function fakeRoute(rows: unknown[] = ROWS, folders: Record<string, { key: string; path: string }> = {}) {
+  const calls: { channel: string; endpoint: string; payload: unknown }[] = []
+  const rpc = async (channel: string, endpoint: string, payload: unknown) => {
+    calls.push({ channel, endpoint, payload: plain(payload) })
+    if (endpoint === 'workspaces') return { ok: true, value: { paused: [], workspaces: rows } }
+    if (endpoint === 'workspaceOf') {
+      const id = (payload as { sessionId: string }).sessionId
+      const found = folders[id]
+      return { ok: true, value: found ? { ...found, paused: false } : null }
+    }
+    return { ok: false, error: { code: 'not-found', message: 'unknown endpoint' } }
+  }
+  return { rpc, calls }
+}
+
+function workspacesOf(loaded: { exports: Record<string, unknown> }, extra: Extra) {
+  const { registrations } = apply(loaded, undefined, extra)
+  const card = registrations[0]?.component
+  assert.ok(card)
+  const page = card({ t, view: 'page' })
+  const [workspaces] = findAll(
+    page,
+    (el) => typeof el.type === 'function' && (el.type as { name?: string }).name === 'Workspaces',
+  )
+  assert.ok(workspaces)
+  return { render: () => (workspaces.type as (props: unknown) => unknown)(workspaces.props), registrations }
+}
+
+describe('client workspaces', () => {
+  it('lists workspaces and pauses one at once, without Save', async () => {
+    const { loaded, release } = loadClient()
+    const pause = fakePauseForm([])
+    const route = fakeRoute()
+    const { render } = workspacesOf(loaded, { rpc: route.rpc, pauseForm: pause.form })
+    render()
+    await tick()
+    let view = render()
+    assert.deepStrictEqual(
+      route.calls.map((call) => [call.channel, call.endpoint]),
+      [['/subagent-concurrency-limit', 'workspaces']],
+    )
+    const text = JSON.stringify(view)
+    assert.ok(text.includes('stateRunning · manyAgents{\\"n\\":2} · partBaton · partWaiting'), text)
+    assert.ok(text.includes('stateIdle'), text)
+    let switches = findAll(view, (el) => el.type === 'Switch')
+    assert.deepStrictEqual(
+      switches.map((el) => el.props?.checked),
+      [false, false],
+    )
+    fire(switches[0], 'onChange', true)
+    // The switch shows the change while it is on its way, and is held still.
+    switches = findAll(render(), (el) => el.type === 'Switch')
+    assert.strictEqual(switches[0]?.props?.checked, true)
+    assert.strictEqual(switches[0]?.props?.disabled, true)
+    await tick()
+    await tick()
+    assert.deepStrictEqual(pause.writes, [['C:\\Work\\A']])
+    view = render()
+    switches = findAll(view, (el) => el.type === 'Switch')
+    assert.deepStrictEqual(
+      switches.map((el) => [el.props?.checked, el.props?.disabled]),
+      [
+        [true, false],
+        [false, false],
+      ],
+    )
+    // Two agents still in their step: pausing, not yet paused.
+    assert.ok(JSON.stringify(view).includes('statePausing · partFinishing'), JSON.stringify(view))
+    release()
+  })
+
+  it('runs changes one at a time, each from the list the last one left', async () => {
+    const { loaded, release } = loadClient()
+    const pause = fakePauseForm([])
+    const { render } = workspacesOf(loaded, { rpc: fakeRoute().rpc, pauseForm: pause.form })
+    render()
+    await tick()
+    const switches = findAll(render(), (el) => el.type === 'Switch')
+    fire(switches[0], 'onChange', true)
+    fire(switches[1], 'onChange', true)
+    for (let i = 0; i < 6; i++) await tick()
+    assert.deepStrictEqual(pause.writes, [['C:\\Work\\A'], ['C:\\Work\\A', 'C:\\Work\\B']])
+    assert.deepStrictEqual(plain(pause.paused()), ['C:\\Work\\A', 'C:\\Work\\B'])
+    release()
+  })
+
+  it('retries a refused change once, from the list the Host answered', async () => {
+    const { loaded } = loadClient()
+    const helpers = loaded.exports.__workspaces as {
+      createPauseControl(form: unknown): { toggle(path: string, paused: boolean): Promise<boolean> }
+    }
+    const pause = fakePauseForm([], { refuse: 1 })
+    const ok = await helpers.createPauseControl(pause.form).toggle('C:\\Work\\A', true)
+    assert.strictEqual(ok, true)
+    assert.deepStrictEqual(pause.writes, [['C:\\Work\\A'], ['D:\\Elsewhere', 'C:\\Work\\A']])
+
+    const stubborn = fakePauseForm([], { refuse: 2 })
+    const control = (loaded.exports.__workspaces as typeof helpers).createPauseControl(stubborn.form) as {
+      toggle(path: string, paused: boolean): Promise<boolean>
+      getSnapshot(): { failed: Set<string> }
+    }
+    assert.strictEqual(await control.toggle('C:\\Work\\A', true), false)
+    assert.strictEqual(stubborn.writes.length, 2)
+    assert.ok(control.getSnapshot().failed.has('c:/work/a'))
+  })
+
+  it('resumes every spelling of a folder and keeps the others', async () => {
+    const { loaded } = loadClient()
+    const helpers = loaded.exports.__workspaces as {
+      createPauseControl(form: unknown): { toggle(path: string, paused: boolean): Promise<boolean> }
+      withPaused(list: string[], path: string, paused: boolean): string[] | undefined
+      projectKey(path: string): string
+    }
+    const pause = fakePauseForm(['C:\\Work\\A', 'c:/work/a/', 'C:\\Work\\B'])
+    assert.strictEqual(await helpers.createPauseControl(pause.form).toggle('C:/WORK/A', false), true)
+    assert.deepStrictEqual(plain(pause.paused()), ['C:\\Work\\B'])
+    assert.strictEqual(helpers.withPaused(['C:\\Work\\B'], 'c:/work/b', true), undefined)
+    assert.strictEqual(helpers.withPaused(['C:\\Work\\B'], 'C:\\Work\\A', false), undefined)
+    assert.strictEqual(helpers.projectKey('C:\\Work\\A\\'), 'c:/work/a')
+  })
+
+  it('shows paused folders the route has not reported, and works without a connection', async () => {
+    const { loaded, release } = loadClient()
+    const pause = fakePauseForm(['E:\\Old'])
+    const { render } = workspacesOf(loaded, { pauseForm: pause.form })
+    render()
+    await tick()
+    const view = render()
+    const text = JSON.stringify(view)
+    assert.ok(text.includes('workspacesUnavailable'), text)
+    assert.ok(text.includes('E:\\\\Old'), text)
+    const switches = findAll(view, (el) => el.type === 'Switch')
+    assert.deepStrictEqual(
+      switches.map((el) => el.props?.checked),
+      [true],
+    )
+    fire(switches[0], 'onChange', false)
+    await tick()
+    await tick()
+    assert.deepStrictEqual(plain(pause.paused()), [])
+    release()
+  })
+
+  it('says why pausing is off when the pause entry is missing or read-only', async () => {
+    for (const [options, expected] of [
+      [{ status: 'unavailable' }, 'pauseUnavailable'],
+      [{ writable: false }, 'pauseReadOnly'],
+    ] as const) {
+      const { loaded, release } = loadClient()
+      const pause = fakePauseForm([], options)
+      const { render } = workspacesOf(loaded, { rpc: fakeRoute().rpc, pauseForm: pause.form })
+      render()
+      await tick()
+      const view = render()
+      assert.ok(JSON.stringify(view).includes(expected), expected)
+      assert.ok(findAll(view, (el) => el.type === 'Switch').every((el) => el.props?.disabled === true))
+      release()
+    }
+  })
+
+  it('words each workspace state', () => {
+    const { loaded } = loadClient()
+    const { workspaceStatus } = loaded.exports.__workspaces as {
+      workspaceStatus(t: unknown, row: Record<string, unknown>, paused: boolean): string
+    }
+    const row = (fields: Record<string, unknown>) => ({ running: 0, held: 0, waiting: 0, holdsBaton: false, ...fields })
+    assert.strictEqual(
+      workspaceStatus(t, row({ running: 3, held: 3 }), true),
+      'statePaused · partHeld{"agents":"manyAgents{\\"n\\":3}"}',
+    )
+    assert.strictEqual(
+      workspaceStatus(t, row({ running: 2, held: 1 }), true),
+      'statePaused · partHeld{"agents":"oneAgent"} · partFinishing{"agents":"oneAgent"}',
+    )
+    assert.strictEqual(workspaceStatus(t, row({}), true), 'statePaused')
+    assert.strictEqual(workspaceStatus(t, row({}), false), 'stateIdle')
+    assert.strictEqual(
+      workspaceStatus(t, row({ running: 1, holdsBaton: true }), false),
+      'stateRunning · oneAgent · partBaton',
+    )
+  })
+})
+
+describe('client composer button', () => {
+  it("pauses and resumes the open chat's workspace", async () => {
+    const { loaded, release } = loadClient()
+    const pause = fakePauseForm([])
+    const route = fakeRoute(ROWS, { s1: { key: 'c:/work/a', path: 'C:\\Work\\A' } })
+    const { registrations } = apply(loaded, undefined, { rpc: route.rpc, pauseForm: pause.form })
+    const button = registrations[1]?.component
+    assert.ok(button)
+    // Nothing until the workspace is known.
+    assert.strictEqual(button({ t, sessionId: 's1' }), null)
+    await tick()
+    let view = button({ t, sessionId: 's1' }) as Element
+    assert.deepStrictEqual(plain(route.calls.at(-1)), {
+      channel: '/subagent-concurrency-limit',
+      endpoint: 'workspaceOf',
+      payload: { sessionId: 's1' },
+    })
+    let [control] = findAll(view, (el) => el.type === 'button')
+    assert.ok(control)
+    assert.strictEqual(control.props?.['aria-pressed'], false)
+    assert.ok(JSON.stringify(control).includes('"pauseWorkspace"'))
+    fire(control, 'onClick')
+    await tick()
+    await tick()
+    assert.deepStrictEqual(plain(pause.paused()), ['C:\\Work\\A'])
+    view = button({ t, sessionId: 's1' }) as Element
+    ;[control] = findAll(view, (el) => el.type === 'button')
+    assert.strictEqual(control?.props?.['aria-pressed'], true)
+    assert.ok(JSON.stringify(control).includes('"resumeWorkspace"'))
+    // A workspace paused from the settings page shows here too; one lookup per chat.
+    assert.strictEqual(route.calls.filter((call) => call.endpoint === 'workspaceOf').length, 1)
+    release()
+  })
+
+  it('stays hidden for an unknown chat or when pausing is unavailable', async () => {
+    const { loaded, release } = loadClient()
+    const route = fakeRoute(ROWS, { s1: { key: 'c:/work/a', path: 'C:\\Work\\A' } })
+    const unknown = apply(loaded, undefined, { rpc: route.rpc, pauseForm: fakePauseForm([]).form }).registrations[1]
+    assert.ok(unknown)
+    unknown.component({ t, sessionId: 'nope' })
+    await tick()
+    assert.strictEqual(unknown.component({ t, sessionId: 'nope' }), null)
+    const locked = apply(loaded, undefined, { rpc: route.rpc, pauseForm: fakePauseForm([], { writable: false }).form })
+      .registrations[1]
+    assert.ok(locked)
+    locked.component({ t, sessionId: 's1' })
+    await tick()
+    assert.strictEqual(locked.component({ t, sessionId: 's1' }), null)
+    release()
   })
 })

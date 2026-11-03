@@ -151,6 +151,64 @@ optionally set a per-provider subagent limit. **Edit as text** shows the same
 map as one line, for example
 `my-llamacpp: limit=4; my-llamacpp-alt: lane=my-llamacpp; my-other-gpu: limit=2 lend=60000`.
 
+## Pausing a workspace
+
+A workspace is a working folder: a chat's folder, compared ignoring case and
+slash direction, the same rule as same-project priority. Subagents belong to
+their parent's workspace. Pause one so another workspace can use the model:
+
+- On the settings page, the **Workspaces** section lists the workspaces the
+  plugin has seen and any paused folders, with what their agents are doing
+  (for example "Paused · 3 agents held" or "Running · 1 agent · holds the
+  baton"). Its switches apply at once, without **Save**, and the list
+  refreshes every few seconds while it is shown.
+- In a chat, the **Pause workspace** button beside the send button pauses
+  that chat's workspace. It reads **Resume workspace** while paused.
+
+What pausing does:
+
+- It takes effect at a step boundary. A model request or tool call already
+  under way finishes, then the agent waits just before its next model
+  request. Nothing in flight is cut off, and the model does not notice.
+- It covers every agent of the workspace on every provider, including
+  unlisted providers and cloud models, and it works with the baton off.
+- A paused workspace keeps its place in the baton's order: once resumed, its
+  children still run before their parents. If its baton holder is inside a
+  long tool call, the baton is lent at once instead of after `lendAfterMs`.
+- Several workspaces can be paused at once. Resuming one puts it back in the
+  queue behind agents already waiting, with no priority.
+- Aborting a paused turn ends its wait.
+
+Limits:
+
+- A paused workspace's subagents keep their pool slots, so other workspaces
+  reach `maxConcurrentSubagents` sooner, and their delegations then queue
+  (and fail after `queueTimeoutMs`). Raise the limit if that matters.
+- Model calls outside agent steps, such as title generation, are not paused.
+- A held agent rechecks about once a second, so a resumed workspace starts
+  within a second or so.
+
+The list is `pausedWorkspaces` on its own entry, `subagent-concurrency-pause`,
+which the bundled patch inserts. It is stored in the profile patch, so pauses
+survive a restart, and it can be edited by hand:
+
+```yaml
+- id: subagent-concurrency-pause
+  config:
+    pausedWorkspaces:
+      - D:/work/app
+```
+
+It is a separate entry so that pausing never interferes with unsaved edits on
+the main settings form: dsh refuses a form's save once its entry has changed
+since the edit began.
+
+The settings page and the button read the workspaces from a small read-only
+route the host half serves at `/subagent-concurrency-limit` (`workspaces` and
+`workspaceOf`). It sits behind dsh's own Host/Origin checks and browser
+authentication. Pausing and resuming write the setting through dsh's settings
+service, which validates and persists it like any other.
+
 ## Install (this fork)
 
 This fork is not on npm. Push it to your GitHub account and install it from
@@ -178,14 +236,24 @@ that list load, and the bundle brings its own `cordis.patch.yml`.
 
 ### Do I need a profile cordis patch?
 
-No. The fork's bundled patch inserts the plugin with baton mode on:
+No. The fork's bundled patch inserts the plugin with baton mode on, plus the
+pause entry that holds the paused workspaces:
 
 ```yaml
-baton: true
-maxConcurrentSubagents: 4
-subagentToolNames:
-  - subagent
+- insert:
+    - id: subagent-concurrency-limit
+      name: dsh-subagent-concurrency-limit
+      config:
+        baton: true
+        maxConcurrentSubagents: 4
+        subagentToolNames:
+          - subagent
+    - id: subagent-concurrency-pause
+      name: './lib/pause.js'
 ```
+
+dsh reads bundle patches on every start, so an update that adds an entry needs
+no profile edit.
 
 To change a value, use the settings page (below) or edit the profile patch by
 hand. Either way the change lands in `$DSH_HOME/profiles/web/cordis.patch.yml`,
@@ -208,9 +276,11 @@ limit).
 
 Every option is a volatile Config field, so it appears on the web client's
 **Plugins** page: open the bundle **dsh-subagent-concurrency-limit** to get a
-form with the baton switch, the lend delay, the concurrency limit, the queue
-timeout and the delegation tool names. **Save** validates against the plugin's schema and
-writes the profile patch.
+form with the workspaces (see [Pausing a workspace](#pausing-a-workspace)),
+the baton switch, the lend delay, the concurrency limit, the queue timeout and
+the delegation tool names. **Save** validates against the plugin's schema and
+writes the profile patch. The workspace switches are not part of **Save**;
+they apply at once.
 
 Changes apply live, without restarting the profile:
 
@@ -267,6 +337,10 @@ checks through `prepublishOnly` before publishing to npm.
 ## License
 
 The project is licensed under [MIT](LICENSE).
+
+`src/rpc-channel.ts` is adapted from
+[dsh-pause](https://github.com/better-er/dsh-pause), Copyright (c) 2026
+betterer, under the MIT License; the file carries its notice.
 
 [dsh-repository]: https://github.com/deepseek-ai/deepseek-harness
 [dsh-commit]: https://github.com/deepseek-ai/deepseek-harness/tree/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e
