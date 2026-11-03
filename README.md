@@ -213,22 +213,15 @@ service, which validates and persists it like any other.
 
 This fork is not on npm. Push it to your GitHub account and install it from
 there. These examples use the `web` profile; replace `web` with your profile
-name, and `<owner>`/`<commit>` with your fork and the commit to install.
+name and `<owner>` with your GitHub account.
 
 ```sh
-dsh plugin --profile web add github:<owner>/dsh-subagent-concurrency-limit#<commit>
+dsh plugin --profile web add github:<owner>/dsh-subagent-concurrency-limit
 ```
 
-`lib/` is not committed, so a git install builds it with the package's
-`prepare` script. pnpm 10 and later block that build until it is allowed. If
-the install stops, add the revision-specific key to
-`$DSH_HOME/profiles/web/pnpm-workspace.yaml` (keep existing entries), then rerun
-the install:
-
-```yaml
-allowBuilds:
-  'dsh-subagent-concurrency-limit@https://codeload.github.com/<owner>/dsh-subagent-concurrency-limit/tar.gz/<commit>': true
-```
+Add `#<branch>` or `#<commit>` to install something other than the default
+branch. The built `lib/` is committed, so the install runs no build step and
+needs no `allowBuilds` entry.
 
 Check that `dsh-subagent-concurrency-limit` is listed under
 `dsh.profile.bundles` in `$DSH_HOME/profiles/web/package.json`. Only bundles in
@@ -313,8 +306,7 @@ dsh --profile web
 
 ## Update
 
-Rerun the install command with the new commit hash (and its new
-`allowBuilds` key).
+Rerun the install command (with the new commit hash, if you pin one).
 
 Restart the profile after updating.
 
@@ -331,8 +323,10 @@ To inspect the package before publishing:
 npm pack --dry-run
 ```
 
-`prepare` builds `lib/` when packing or publishing. `npm publish` runs the
-checks through `prepublishOnly` before publishing to npm.
+`lib/` is committed so a GitHub install needs no build. After changing
+`src/`, run `pnpm run build` and commit `lib/` with the change;
+`pnpm run check` fails (`check:lib`) when the committed `lib/` does not match
+what `src/` builds to. `npm publish` runs the checks through `prepublishOnly`.
 
 ## License
 

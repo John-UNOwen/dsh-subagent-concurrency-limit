@@ -144,6 +144,7 @@ dist
 # End of https://www.toptal.com/developers/gitignore/api/node
 
 ### Repository-specific ###
-lib/
+# lib/ is committed: a GitHub install then needs no build step.
+.lib-check/
 _tmp_*/
 tmp/

@@ -45,9 +45,9 @@
     "lint": "biome ci",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.contract.json",
     "test": "node --test tests/*.spec.ts",
-    "check": "pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run build",
-    "prepare": "tsc -p tsconfig.json",
-    "prepublishOnly": "pnpm run check"
+    "check": "pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run check:lib",
+    "prepublishOnly": "pnpm run check",
+    "check:lib": "node scripts/check-lib.mjs"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0",

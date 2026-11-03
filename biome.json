@@ -26,5 +26,8 @@
     "assist": {
       "enabled": false
     }
+  },
+  "files": {
+    "includes": ["**", "!lib"]
   }
 }
