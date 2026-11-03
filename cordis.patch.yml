@@ -12,4 +12,6 @@
         subagentToolNames:
           - subagent
     - id: subagent-concurrency-pause
-      name: './lib/pause.js'
+      # A package subpath, not a file path: dsh's client loader refuses one
+      # package reached through two file-resolved names.
+      name: dsh-subagent-concurrency-limit/pause

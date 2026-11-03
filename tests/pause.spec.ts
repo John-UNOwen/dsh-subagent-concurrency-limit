@@ -566,3 +566,23 @@ describe('pause row', () => {
     assert.strictEqual('pausedWorkspaces' in main, false)
   })
 })
+
+describe('bundle patch', () => {
+  it('names every row by the package or an exported subpath, never a file path', async () => {
+    const { readFileSync, existsSync } = await import('node:fs')
+    const root = new URL('../', import.meta.url)
+    const pkg = JSON.parse(readFileSync(new URL('package.json', root), 'utf8'))
+    const names = [...readFileSync(new URL('cordis.patch.yml', root), 'utf8').matchAll(/^\s+name:\s*(\S+)\s*$/gm)].map(
+      (match) => match[1]?.replace(/^['"]|['"]$/g, '') ?? '',
+    )
+    assert.deepStrictEqual(names, [pkg.name, `${pkg.name}/pause`])
+    // dsh's client loader keys a package's sources by row name; a second
+    // file-resolved name for this package stops dsh from starting.
+    for (const name of names) {
+      const subpath = name === pkg.name ? '.' : `./${name.slice(pkg.name.length + 1)}`
+      const target = pkg.exports[subpath]
+      assert.ok(target, `${subpath} is exported`)
+      assert.ok(existsSync(new URL(target.default, root)), `${target.default} exists`)
+    }
+  })
+})

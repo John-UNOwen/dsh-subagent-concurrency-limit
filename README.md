@@ -242,7 +242,7 @@ pause entry that holds the paused workspaces:
         subagentToolNames:
           - subagent
     - id: subagent-concurrency-pause
-      name: './lib/pause.js'
+      name: dsh-subagent-concurrency-limit/pause
 ```
 
 dsh reads bundle patches on every start, so an update that adds an entry needs
