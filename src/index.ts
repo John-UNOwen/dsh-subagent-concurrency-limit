@@ -1204,6 +1204,8 @@ interface WorkspaceRow {
   running: number
   /** Agents waiting at the pause gate. */
   held: number
+  /** Running agents inside a tool call or approval, not held. */
+  inTool: number
   /** Agents queued for a baton. */
   waiting: number
   /** Whether one of its agents holds a baton now. */
@@ -1450,6 +1452,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     { prepend: true },
   )
 
+  /** Open tool calls and approvals per agent, for the workspaces route. */
+  const toolDepth = new Map<string, number>()
+
   /** Count `run` as tool time of `agentId`, so the baton can be lent while it waits. */
   async function asToolTime<T>(agentId: string, signal: AbortSignal | undefined, run: () => Promise<T>): Promise<T> {
     let done = false
@@ -1458,8 +1463,12 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (done) return
       done = true
       signal?.removeEventListener('abort', end)
+      const depth = (toolDepth.get(agentId) ?? 1) - 1
+      if (depth > 0) toolDepth.set(agentId, depth)
+      else toolDepth.delete(agentId)
       for (const lane of counted) lane.baton.toolEnd(agentId)
     }
+    toolDepth.set(agentId, (toolDepth.get(agentId) ?? 0) + 1)
     for (const lane of counted) lane.baton.toolStart(agentId)
     // A cancelled approval resolves without waiting for its answerer.
     signal?.addEventListener('abort', end, { once: true })
@@ -1742,6 +1751,7 @@ export function apply(ctx: Context, config: Config = {}): void {
           paused: workspacePaused(key),
           running: 0,
           held: 0,
+          inTool: 0,
           waiting: 0,
           holdsBaton: false,
         }
@@ -1751,7 +1761,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     }
     for (const [agentId, key] of projectByAgent) {
       const entry = row(key, key)
-      if (runningAgents.has(agentId)) entry.running++
+      if (!runningAgents.has(agentId)) continue
+      entry.running++
+      if ((toolDepth.get(agentId) ?? 0) > 0 && !heldAgents.has(agentId)) entry.inTool++
     }
     try {
       for (const session of sessions?.list() ?? []) {

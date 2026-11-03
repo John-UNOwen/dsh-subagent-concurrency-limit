@@ -77,6 +77,7 @@ window.__ModuleLoader__.load({
       manyAgents: '{n} agents',
       partHeld: '{agents} held',
       partFinishing: '{agents} finishing a step',
+      partInTool: '{agents} in a tool call',
       partBaton: 'holds the baton',
       partWaiting: '{agents} waiting for the baton',
       workspacesLoading: 'Loading workspaces…',
@@ -150,6 +151,7 @@ window.__ModuleLoader__.load({
       manyAgents: '{n} 个代理',
       partHeld: '{agents}已停下',
       partFinishing: '{agents}正在完成当前步骤',
+      partInTool: '{agents}在工具调用中',
       partBaton: '持有接力棒',
       partWaiting: '{agents}在等待接力棒',
       workspacesLoading: '正在加载工作区…',
@@ -753,24 +755,45 @@ window.__ModuleLoader__.load({
     function createWorkspaceLookup(route) {
       var listeners = new Set()
       var found = new Map()
+      var retries = new Map()
       var set = (sessionId, entry) => {
         found = new Map(found)
         found.set(sessionId, entry)
         for (var listener of listeners) listener()
       }
+      var stopRetries = () => {
+        for (var timer of retries.values()) clearTimeout(timer)
+        retries.clear()
+      }
       var lookup = {
         subscribe: (listener) => {
           listeners.add(listener)
-          return () => listeners.delete(listener)
+          return () => {
+            listeners.delete(listener)
+            if (listeners.size === 0) stopRetries()
+          }
         },
         getSnapshot: () => found,
-        want: (sessionId) => {
+        want: (sessionId, retry) => {
           if (typeof sessionId !== 'string' || sessionId.length === 0 || route.call === undefined) return
           var known = found.get(sessionId)
           if (known !== undefined && known.status !== 'missing') return
-          if (known !== undefined && Date.now() - known.at < LOOKUP_RETRY_MS) return
+          if (known !== undefined && !retry && Date.now() - known.at < LOOKUP_RETRY_MS) return
+          clearTimeout(retries.get(sessionId))
+          retries.delete(sessionId)
           set(sessionId, { status: 'loading' })
-          var missing = () => set(sessionId, { status: 'missing', at: Date.now() })
+          // Ask again later while a composer shows, without waiting for a re-render.
+          var missing = () => {
+            set(sessionId, { status: 'missing', at: Date.now() })
+            if (listeners.size === 0) return
+            retries.set(
+              sessionId,
+              setTimeout(() => {
+                retries.delete(sessionId)
+                if (listeners.size > 0) lookup.want(sessionId, true)
+              }, LOOKUP_RETRY_MS),
+            )
+          }
           route.request('workspaceOf', { sessionId: sessionId }).then((result) => {
             var value = result?.ok ? result.value : undefined
             if (value && typeof value.key === 'string' && typeof value.path === 'string')
@@ -791,7 +814,7 @@ window.__ModuleLoader__.load({
       for (var path of paused) {
         const key = projectKey(path)
         if (!byKey.has(key))
-          byKey.set(key, { key: key, path: path, running: 0, held: 0, waiting: 0, holdsBaton: false })
+          byKey.set(key, { key: key, path: path, running: 0, held: 0, inTool: 0, waiting: 0, holdsBaton: false })
       }
       return [...byKey.values()].sort((a, b) => a.path.localeCompare(b.path))
     }
@@ -805,12 +828,17 @@ window.__ModuleLoader__.load({
       var running = row.running || 0
       var held = row.held || 0
       var waiting = row.waiting || 0
+      var inTool = row.inTool || 0
       var parts = []
       if (paused) {
-        // Held agents wait at the gate; the others are finishing the step they were in.
-        const finishing = Math.max(0, running - held)
-        parts.push(held === 0 && finishing > 0 ? t('statePausing') : t('statePaused'))
-        if (held > 0) parts.push(t('partHeld', { agents: agentCount(t, held) }))
+        // Stopped: held at the gate, or queued for the baton (they cannot get
+        // it while paused). In a tool: a running tool, or a parent waiting on
+        // a paused subagent. Only the rest are still generating a step.
+        const stopped = held + waiting
+        const finishing = Math.max(0, running - stopped - inTool)
+        parts.push(finishing > 0 ? t('statePausing') : t('statePaused'))
+        if (stopped > 0) parts.push(t('partHeld', { agents: agentCount(t, stopped) }))
+        if (inTool > 0) parts.push(t('partInTool', { agents: agentCount(t, inTool) }))
         if (finishing > 0) parts.push(t('partFinishing', { agents: agentCount(t, finishing) }))
       } else {
         parts.push(running > 0 || row.holdsBaton || waiting > 0 ? t('stateRunning') : t('stateIdle'))

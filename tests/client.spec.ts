@@ -537,8 +537,8 @@ describe('client workspaces', () => {
         [false, false],
       ],
     )
-    // Two agents still in their step: pausing, not yet paused.
-    assert.ok(JSON.stringify(view).includes('statePausing · partFinishing'), JSON.stringify(view))
+    // One agent still generating its step (the other is queued): pausing, not yet paused.
+    assert.ok(JSON.stringify(view).includes('statePausing · partHeld'), JSON.stringify(view))
     release()
   })
 
@@ -643,9 +643,18 @@ describe('client workspaces', () => {
     )
     assert.strictEqual(
       workspaceStatus(t, row({ running: 2, held: 1 }), true),
-      'statePaused · partHeld{"agents":"oneAgent"} · partFinishing{"agents":"oneAgent"}',
+      'statePausing · partHeld{"agents":"oneAgent"} · partFinishing{"agents":"oneAgent"}',
     )
     assert.strictEqual(workspaceStatus(t, row({}), true), 'statePaused')
+    // A parent waiting on its paused subagent, and an agent queued for the baton, are not finishing a step.
+    assert.strictEqual(
+      workspaceStatus(t, row({ running: 3, held: 1, waiting: 1, inTool: 1 }), true),
+      'statePaused · partHeld{"agents":"manyAgents{\\"n\\":2}"} · partInTool{"agents":"oneAgent"}',
+    )
+    assert.strictEqual(
+      workspaceStatus(t, row({ running: 2, inTool: 1 }), true),
+      'statePausing · partInTool{"agents":"oneAgent"} · partFinishing{"agents":"oneAgent"}',
+    )
     assert.strictEqual(workspaceStatus(t, row({}), false), 'stateIdle')
     assert.strictEqual(
       workspaceStatus(t, row({ running: 1, holdsBaton: true }), false),
@@ -686,6 +695,23 @@ describe('client composer button', () => {
     // A workspace paused from the settings page shows here too; one lookup per chat.
     assert.strictEqual(route.calls.filter((call) => call.endpoint === 'workspaceOf').length, 1)
     release()
+  })
+
+  it('asks again for a chat whose workspace was not known yet, without a re-render', async (t2) => {
+    t2.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+    const { loaded } = loadClient()
+    const folders: Record<string, { key: string; path: string }> = {}
+    const route = fakeRoute(ROWS, folders)
+    const button = apply(loaded, undefined, { rpc: route.rpc, pauseForm: fakePauseForm([]).form }).registrations[1]
+    assert.ok(button)
+    assert.strictEqual(button.component({ t, sessionId: 's1' }), null)
+    await tick()
+    // The chat steps now, so the route would know it.
+    folders.s1 = { key: 'c:/work/a', path: 'C:\\Work\\A' }
+    t2.mock.timers.tick(5000)
+    await tick()
+    assert.strictEqual(route.calls.filter((call) => call.endpoint === 'workspaceOf').length, 2)
+    assert.notStrictEqual(button.component({ t, sessionId: 's1' }), null)
   })
 
   it('stays hidden for an unknown chat or when pausing is unavailable', async () => {

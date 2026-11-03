@@ -189,6 +189,40 @@ describe('workspaces route', () => {
     await held
   })
 
+  it('counts agents inside a tool apart from held ones', async () => {
+    const ctx = new Context()
+    await ctx.plugin(FakeWebServer)
+    await ctx.plugin(OpenConnection)
+    const paused = { value: [] as readonly string[], get: () => paused.value }
+    apply(ctx, { baton: true, pausedWorkspaces: paused, pausePollMs: 5 })
+    await wait()
+    const route = routeOf(ctx)
+    // A parent waiting on its subagent sits in a tool for the whole pause.
+    const parent = agent('session-a', 'C:\\Work\\Alpha')
+    await step(ctx, parent)
+    paused.value = ['c:/work/alpha']
+    let finish: () => void = () => {}
+    const tool = ctx.waterfall(
+      ctx as never,
+      'tools/execute',
+      { name: 'bash', agent: parent, signal: new AbortController().signal } as never,
+      () => new Promise((resolve) => (finish = () => resolve({ content: [] }))),
+    )
+    await wait()
+    const rowOf = async () => {
+      const reply = JSON.parse((await call(route, 'workspaces', {})).body)
+      return reply.result.value.workspaces.find((row: { key: string }) => row.key === 'c:/work/alpha')
+    }
+    let row = await rowOf()
+    assert.strictEqual(row?.running, 1)
+    assert.strictEqual(row?.inTool, 1)
+    assert.strictEqual(row?.held, 0)
+    finish()
+    await tool
+    row = await rowOf()
+    assert.strictEqual(row?.inTool, 0)
+  })
+
   it('finds the workspace of a chat, also before it has stepped', async () => {
     const ctx = new Context()
     await ctx.plugin(FakeWebServer)
