@@ -1,1 +1,2 @@
-lib/** text eol=lf
+# LF everywhere, so a Windows checkout (core.autocrlf=true) still passes biome.
+* text=auto eol=lf

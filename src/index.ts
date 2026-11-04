@@ -24,6 +24,8 @@ const DEFAULT_PROJECT_PRIORITY_MS = 600_000
 export const CHANNEL = '/subagent-concurrency-limit'
 /** How often a held agent, or a waiter behind a holder in a tool, re-checks the pause list. */
 const DEFAULT_PAUSE_POLL_MS = 1_000
+/** How long a successful delegation may wait for its run to be published. */
+const DEFAULT_PENDING_RESERVATION_MS = 10_000
 /** Node fires any longer timer after 1 ms, so every wait is clamped to this. */
 const MAX_TIMER_MS = 2_147_483_647
 
@@ -68,6 +70,8 @@ export interface Config {
   pausedWorkspaces?: Live<readonly string[]>
   /** Internal: how often pause changes are re-checked, in milliseconds. */
   pausePollMs?: Live<number>
+  /** Internal: how long an unpublished delegation keeps its permit, in milliseconds. */
+  pendingReservationMs?: Live<number>
 }
 
 /** One provider lane's overrides. */
@@ -420,13 +424,23 @@ class Baton {
       this.owner = child
       this.settle()
     } else if (this.suspended.includes(parent)) {
-      let queue = this.delegated.get(parent)
-      if (queue === undefined) {
-        queue = []
-        this.delegated.set(parent, queue)
+      this.queueChild(this.delegated, parent, child)
+    } else {
+      // The parent's place is parked with its paused workspace: the child
+      // joins it there, so it still runs before its parent after unpause.
+      for (const frame of this.frames.values()) {
+        if (frame.stack.includes(parent)) this.queueChild(frame.delegated, parent, child)
       }
-      if (!queue.includes(child)) queue.push(child)
     }
+  }
+
+  private queueChild(delegated: Map<string, string[]>, parent: string, child: string): void {
+    let queue = delegated.get(parent)
+    if (queue === undefined) {
+      queue = []
+      delegated.set(parent, queue)
+    }
+    if (!queue.includes(child)) queue.push(child)
   }
 
   toolStart(id: string): void {
@@ -653,8 +667,12 @@ class Baton {
     if (this.closed || this.waiters.length === 0) return
     const toolTime = this.ownerToolTime()
     let delay: number
-    if (toolTime !== undefined) delay = Math.min(Math.max(this.lendAfterMs() - toolTime, 0), this.pollMs())
-    else if (this.owner === undefined) delay = this.pollMs()
+    // Past lendAfterMs every allowed borrower has borrowed already; only a
+    // pause change can alter that, so re-check at the poll interval.
+    if (toolTime !== undefined) {
+      const untilLend = this.lendAfterMs() - toolTime
+      delay = untilLend > 0 ? Math.min(untilLend, this.pollMs()) : this.pollMs()
+    } else if (this.owner === undefined) delay = this.pollMs()
     else return
     this.lendTimer = setTimeout(
       () => {
@@ -944,6 +962,7 @@ interface Settings {
   /** Read the pause list from the pause row's service while it is mounted. */
   usePauseRow(source: PauseSource | undefined): void
   pausePollMs(): number
+  pendingReservationMs(): number
 }
 
 function isPositiveInteger(value: unknown): value is number {
@@ -1047,6 +1066,12 @@ function resolveConfig(config: Config): Settings {
     isPositiveInteger,
     'pausePollMs must be positive',
   )
+  const pendingReservationMs = liveField(
+    config.pendingReservationMs,
+    DEFAULT_PENDING_RESERVATION_MS,
+    isPositiveInteger,
+    'pendingReservationMs must be positive',
+  )
   let pauseRow: PauseSource | undefined
   /** The pause row's list when it is mounted, else this plugin's own option. */
   const pausedPaths = (): readonly string[] => {
@@ -1063,6 +1088,7 @@ function resolveConfig(config: Config): Settings {
   let namesSet: ReadonlySet<string> = new Set()
   return {
     pausePollMs,
+    pendingReservationMs,
     pausedPaths,
     usePauseRow(source: PauseSource | undefined) {
       pauseRow = source
@@ -1318,6 +1344,35 @@ export function apply(ctx: Context, config: Config = {}): void {
     release(lease)
   }
 
+  /**
+   * A successful delegation that publishes no run (a workflow call, a
+   * background job whose start failed) would otherwise hold its permit until
+   * the delegating agent is disposed. Give a deferred publish a grace period,
+   * then free the permit.
+   */
+  const reservationTimers = new Set<ReturnType<typeof setTimeout>>()
+  function expireReservation(agentId: string, reservation: Reservation): void {
+    const timer = setTimeout(() => {
+      reservationTimers.delete(timer)
+      if (reservation.state !== 'open') return
+      reservation.state = 'done'
+      release(reservation)
+      const pending = pendingByAgentId.get(agentId)
+      const index = pending?.indexOf(reservation) ?? -1
+      if (pending !== undefined && index >= 0) pending.splice(index, 1)
+      if (pending?.length === 0) pendingByAgentId.delete(agentId)
+    }, settings.pendingReservationMs())
+    timer.unref?.()
+    reservationTimers.add(timer)
+  }
+  ctx.effect(
+    () => () => {
+      for (const timer of reservationTimers) clearTimeout(timer)
+      reservationTimers.clear()
+    },
+    'subagent concurrency reservation timers',
+  )
+
   /** A child that goes idle before its first step never uses its reservation: free it. */
   function releaseUnusedReservations(agentId: string): void {
     for (const run of startsByRunId.values()) {
@@ -1554,6 +1609,7 @@ export function apply(ctx: Context, config: Config = {}): void {
           pendingByAgentId.set(agentId, pending)
         }
         pending.push(reservation)
+        expireReservation(agentId, reservation)
       }
     }
   })

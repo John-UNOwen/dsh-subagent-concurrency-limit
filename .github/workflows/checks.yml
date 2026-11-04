@@ -38,11 +38,17 @@ jobs:
       - name: Install plugin dependencies
         run: pnpm install --frozen-lockfile
 
+      # Against the empty tree, so every committed file is checked (a plain
+      # `git diff --check` on a clean checkout compares nothing).
       - name: Check whitespace
-        run: git diff --check
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD
 
       - name: Check formatting and lint
         run: pnpm run lint
+
+      # Before the harness packages change: lib/ is what a GitHub install serves.
+      - name: Check committed lib/ matches src/
+        run: pnpm run check:lib
 
       - name: Resolve latest DeepSeek Harness release
         id: dsh-release

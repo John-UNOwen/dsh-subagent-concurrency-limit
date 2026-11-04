@@ -51,6 +51,8 @@ export interface Config {
     pausedWorkspaces?: Live<readonly string[]>;
     /** Internal: how often pause changes are re-checked, in milliseconds. */
     pausePollMs?: Live<number>;
+    /** Internal: how long an unpublished delegation keeps its permit, in milliseconds. */
+    pendingReservationMs?: Live<number>;
 }
 /** One provider lane's overrides. */
 export interface ProviderConfig {

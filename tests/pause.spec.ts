@@ -586,3 +586,135 @@ describe('bundle patch', () => {
     }
   })
 })
+
+/** A tool call that stays open; `onStart` runs inside it, in its async context. */
+function openTool(ctx: Context, a: Agent, name: string, onStart: () => void | Promise<void>) {
+  let finish = () => {}
+  const done = tool(
+    ctx,
+    a,
+    async () => {
+      await onStart()
+      return new Promise<ToolExecutionResult>((resolve) => (finish = () => resolve(result())))
+    },
+    name,
+  )
+  return { done, finish: () => finish() }
+}
+
+const publish = (ctx: Context, runId: string, id: string) =>
+  ctx.emit(ctx as never, 'subagent/start', { runId, provider: 'spawn', id, local: true })
+
+describe('checkup fixes', () => {
+  it('queues a child published while its parent is parked ahead of the parent (#1)', async () => {
+    const ctx = new Context()
+    const paused = live<readonly string[]>([])
+    apply(ctx, {
+      baton: true,
+      maxConcurrentSubagents: 8,
+      pausedWorkspaces: paused,
+      pausePollMs: 5,
+      projectPriorityMs: 0,
+    })
+    const root = agent('root', 0, { cwd: ALPHA })
+    const c1 = agent('c1', 1, { cwd: ALPHA })
+    const c2 = agent('c2', 1, { cwd: ALPHA })
+    const other = agent('other', 0, { cwd: BETA })
+    const entered: string[] = []
+    await step(ctx, root, entered)
+    const t1 = openTool(ctx, root, 'subagent', () => publish(ctx, 'r1', 'c1'))
+    await flush()
+    await step(ctx, c1, entered)
+    let release2 = () => {}
+    const gate2 = new Promise<void>((resolve) => (release2 = resolve))
+    const t2 = tool(
+      ctx,
+      root,
+      async () => {
+        await gate2
+        publish(ctx, 'r2', 'c2')
+        return result()
+      },
+      'subagent',
+    )
+    await flush()
+    const otherStep = step(ctx, other, entered)
+    paused.set([ALPHA])
+    const c1Tool = longTool(ctx, c1)
+    await otherStep
+    // The second child is published while the tree is parked.
+    release2()
+    await t2
+    t1.finish()
+    await t1.done
+    const rootNext = step(ctx, root, entered)
+    c1Tool.finish()
+    await c1Tool.done
+    const c1Next = step(ctx, c1, entered)
+    const c2Step = step(ctx, c2, entered)
+    await sleep(20)
+    paused.set([])
+    status(ctx, other, 'idle')
+    await c1Next
+    status(ctx, c1, 'idle')
+    endRun(ctx, 'r1', 'c1')
+    await c2Step
+    assert.deepStrictEqual(entered.slice(-2), ['c1', 'c2'])
+    status(ctx, c2, 'idle')
+    endRun(ctx, 'r2', 'c2')
+    await rootNext
+    assert.deepStrictEqual(entered.slice(-1), ['root'])
+    status(ctx, root, 'idle')
+  })
+
+  it('frees the permit of a delegation that publishes no run (#4)', async () => {
+    const ctx = new Context()
+    apply(ctx, {
+      maxConcurrentSubagents: 1,
+      queueTimeoutMs: 2_000,
+      subagentToolNames: ['subagent', 'workflow'],
+      pendingReservationMs: 30,
+    })
+    const a = agent('a', 0, { cwd: ALPHA })
+    await tool(ctx, a, () => Promise.resolve(result()), 'workflow')
+    status(ctx, a, 'idle')
+    const started = Date.now()
+    await tool(ctx, a, () => Promise.resolve(result()), 'subagent')
+    assert.ok(Date.now() - started < 1_000)
+  })
+
+  it('re-checks at the poll interval once the owner is past lendAfterMs (#5)', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true, lendAfterMs: 20, pausePollMs: 1_000 })
+    const root = agent('root', 0, { cwd: ALPHA })
+    const child = agent('child', 1, { cwd: ALPHA })
+    const entered: string[] = []
+    await step(ctx, root, entered)
+    const t = openTool(ctx, root, 'subagent', () => publish(ctx, 'r', 'child'))
+    await flush()
+    await step(ctx, child, entered)
+    const childTool = longTool(ctx, child)
+    t.finish()
+    await t.done
+    // The parent queues and may not borrow from its own child.
+    const rootNext = step(ctx, root, entered)
+    const real = globalThis.setTimeout
+    let short = 0
+    globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => {
+      if ((ms ?? 0) < 5) short++
+      return real(fn, ms, ...rest)
+    }) as typeof setTimeout
+    try {
+      await sleep(200)
+    } finally {
+      globalThis.setTimeout = real
+    }
+    assert.ok(short <= 2, `${short} near-zero re-checks`)
+    childTool.finish()
+    await childTool.done
+    status(ctx, child, 'idle')
+    endRun(ctx, 'r', 'child')
+    await rootNext
+    status(ctx, root, 'idle')
+  })
+})
