@@ -24,6 +24,8 @@ const DEFAULT_PROJECT_PRIORITY_MS = 600_000
 export const CHANNEL = '/subagent-concurrency-limit'
 /** How often a held agent, or a waiter behind a holder in a tool, re-checks the pause list. */
 const DEFAULT_PAUSE_POLL_MS = 1_000
+/** How often a gate with queued callers re-reads its live limit. */
+const LIMIT_POLL_MS = 1_000
 /** How long a successful delegation may wait for its run to be published. */
 const DEFAULT_PENDING_RESERVATION_MS = 10_000
 /** Node fires any longer timer after 1 ms, so every wait is clamped to this. */
@@ -155,6 +157,7 @@ class ConcurrencyGate {
   private readonly waiters: Waiter[] = []
   private readonly limit: () => number
   private closed = false
+  private pollTimer: ReturnType<typeof setTimeout> | undefined
 
   constructor(limit: () => number) {
     this.limit = limit
@@ -163,6 +166,25 @@ class ConcurrencyGate {
   /** Admit waiters a raised limit now has room for. */
   pump(): void {
     while (!this.closed && this.waiters.length > 0 && this.hasRoom()) this.admitNext()
+  }
+
+  /** Whether anything holds or waits for a permit. */
+  busy(): boolean {
+    return this.active.size > 0 || this.waiters.length > 0
+  }
+
+  /**
+   * The limit is a live setting with no change event: re-read it while anyone
+   * queues, so a raised limit admits them without waiting for other activity.
+   */
+  private schedulePoll(): void {
+    if (this.pollTimer !== undefined || this.closed) return
+    this.pollTimer = setTimeout(() => {
+      this.pollTimer = undefined
+      this.pump()
+      if (this.waiters.length > 0) this.schedulePoll()
+    }, LIMIT_POLL_MS)
+    this.pollTimer.unref?.()
   }
 
   /** Whether one more key fits under the limit, not counting forced keys. */
@@ -204,6 +226,7 @@ class ConcurrencyGate {
         }, delay)
         signal.addEventListener('abort', waiter.abort, { once: true })
         this.waiters.push(waiter)
+        this.schedulePoll()
       })
       signal.throwIfAborted()
     } catch (error) {
@@ -242,6 +265,8 @@ class ConcurrencyGate {
   close(): void {
     if (this.closed) return
     this.closed = true
+    if (this.pollTimer !== undefined) clearTimeout(this.pollTimer)
+    this.pollTimer = undefined
     this.active.clear()
     this.forced.clear()
     const error = new Error('subagent concurrency limit is disposed')
@@ -539,6 +564,17 @@ class Baton {
       waiter.signal.removeEventListener('abort', waiter.abort)
       waiter.reject(error)
     }
+  }
+
+  /** Whether the baton holds no state: no owner, waiter, suspended agent or parked frame. */
+  idle(): boolean {
+    return (
+      this.owner === undefined &&
+      this.waiters.length === 0 &&
+      this.suspended.length === 0 &&
+      this.delegated.size === 0 &&
+      this.frames.size === 0
+    )
   }
 
   /** Read-only view for the workspaces route. */
@@ -1203,14 +1239,34 @@ function projectKey(cwd: string): string {
  * the first follower by name, so the result never depends on key order.
  */
 function laneSettings(listed: Readonly<Record<string, ProviderConfig>>, lane: string): ProviderConfig | undefined {
-  if (Object.hasOwn(listed, lane)) {
-    const root = listed[lane]
-    if (root.lane === undefined || root.lane === lane) return root
+  if (Object.hasOwn(listed, lane) && laneRootOf(listed, lane) === lane) return listed[lane]
+  const followers = Object.keys(listed).filter((name) => laneRootOf(listed, name) === lane)
+  if (followers.length === 0) return undefined
+  // No entry of its own: the strictest setting any provider on it states.
+  const stated = <K extends keyof ProviderConfig>(field: K) =>
+    followers
+      .map((name) => listed[name][field])
+      .filter((value): value is NonNullable<ProviderConfig[K]> => value !== undefined)
+  const limits = stated('maxConcurrentSubagents')
+  const lends = stated('lendAfterMs')
+  const batons = stated('baton')
+  return {
+    ...(limits.length > 0 ? { maxConcurrentSubagents: Math.min(...limits) } : {}),
+    ...(lends.length > 0 ? { lendAfterMs: Math.max(...lends) } : {}),
+    ...(batons.length > 0 ? { baton: batons.includes(true) } : {}),
   }
-  const followers = Object.keys(listed)
-    .filter((name) => (listed[name].lane ?? name) === lane)
-    .sort()
-  return followers.length > 0 ? listed[followers[0]] : undefined
+}
+
+/** The lane a provider runs on: its `lane` chain followed to the end (a cycle stops where it repeats). */
+function laneRootOf(listed: Readonly<Record<string, ProviderConfig>>, provider: string): string {
+  let current = provider
+  const seen = new Set<string>([current])
+  for (;;) {
+    const next = Object.hasOwn(listed, current) ? listed[current].lane : undefined
+    if (next === undefined || next === current || seen.has(next)) return current
+    seen.add(next)
+    current = next
+  }
 }
 
 /** The part of dsh's session store the status route reads. */
@@ -1276,27 +1332,59 @@ export function apply(ctx: Context, config: Config = {}): void {
   const pendingByAgentId = new Map<string, Reservation[]>()
   const toolAgent = new AsyncLocalStorage<string>()
 
+  /**
+   * The providers map lanes are built from. A live edit can move providers
+   * between lanes or flip a lane's baton; applied under in-flight work it
+   * would split one server's permits and baton across two lanes. So an edit
+   * is adopted once no lane holds or awaits anything, and the old lanes are
+   * dropped then. Per-lane limits and lend delays still apply at once.
+   */
+  let providerView = settings.providers()
+  let providerViewKey = JSON.stringify(providerView)
+  let providersPending = false
+  function providersNow(): Readonly<Record<string, ProviderConfig>> {
+    const next = settings.providers()
+    if (next === providerView) return providerView
+    const key = JSON.stringify(next)
+    if (key === providerViewKey) {
+      providerView = next
+      providersPending = false
+    } else if ([...lanes.values()].every((lane) => !lane.gate.busy() && lane.baton.idle())) {
+      for (const lane of lanes.values()) lane.close()
+      lanes.clear()
+      batonLaneOf.clear()
+      providerView = next
+      providerViewKey = key
+      providersPending = false
+    } else {
+      providersPending = true
+    }
+    return providerView
+  }
+
   function laneFor(provider: string | undefined): Lane | undefined {
-    const listed = settings.providers()
+    const listed = providersNow()
     let key: string | undefined = GLOBAL_LANE
     if (Object.keys(listed).length > 0) {
       if (provider === undefined) return undefined
-      const entry = Object.hasOwn(listed, provider) ? listed[provider] : undefined
       // A provider another entry names as its lane runs on that lane even
       // when it is not listed itself: it is the server the lane stands for.
-      if (entry === undefined && !Object.values(listed).some((other) => other.lane === provider)) return undefined
-      key = `lane:${entry?.lane ?? provider}`
+      if (!Object.hasOwn(listed, provider) && !Object.values(listed).some((other) => other.lane === provider))
+        return undefined
+      key = `lane:${laneRootOf(listed, provider)}`
     }
     let lane = lanes.get(key)
     if (lane === undefined) {
       const laneName = key.slice('lane:'.length)
-      const own = () => (key === GLOBAL_LANE ? undefined : laneSettings(settings.providers(), laneName))
+      const adopted = () => (key === GLOBAL_LANE ? undefined : laneSettings(providerView, laneName))
+      // Limits and lend delays follow the live settings while the lane exists in them.
+      const live = () => (key === GLOBAL_LANE ? undefined : (laneSettings(settings.providers(), laneName) ?? adopted()))
       lane = new Lane(
         key,
-        () => own()?.baton ?? settings.baton(),
-        () => own()?.maxConcurrentSubagents ?? settings.limit(),
+        () => adopted()?.baton ?? settings.baton(),
+        () => live()?.maxConcurrentSubagents ?? settings.limit(),
         {
-          lendAfterMs: () => own()?.lendAfterMs ?? settings.lendAfterMs(),
+          lendAfterMs: () => live()?.lendAfterMs ?? settings.lendAfterMs(),
           projectOf: (id) => projectByAgent.get(id),
           projectPriorityMs: settings.projectPriorityMs,
           isPaused: (project) => settings.pausedProjects().has(project),
@@ -1372,6 +1460,47 @@ export function apply(ctx: Context, config: Config = {}): void {
     },
     'subagent concurrency reservation timers',
   )
+
+  /**
+   * A child whose provider changed mid-turn generates on another lane: move
+   * its turn permit there before its next request, so the old lane is not
+   * pinned and the new one counts it. It queues like a root delegation's child
+   * at depth 1; deeper, or with the baton on, it never waits (it may be awaited
+   * by an ancestor), keeping the old permit if the new lane is full.
+   */
+  async function movePermit(
+    agentId: string,
+    held: object,
+    lane: Lane | undefined,
+    signal: AbortSignal,
+    depth: number,
+  ): Promise<void> {
+    if (gateOf.get(held) === lane?.gate) return
+    if (lane === undefined) {
+      releaseTurn(agentId)
+      return
+    }
+    const moved = {}
+    enterKey(lane.gate, moved)
+    if (lane.batonOn()) {
+      if (!lane.gate.tryEnter(moved, signal)) lane.gate.forceEnter(moved)
+    } else if (depth > 1) {
+      if (!lane.gate.tryEnter(moved, signal)) return
+    } else {
+      await lane.gate.enter(moved, signal, settings.queueTimeoutMs())
+    }
+    if (activeTurnsByAgentId.get(agentId) !== held) {
+      lane.gate.release(moved)
+      return
+    }
+    for (const run of startsByRunId.values()) {
+      if (run.lease !== held) continue
+      run.lease = moved
+      if (run.reservation === held) run.reservation.state = 'done'
+    }
+    activeTurnsByAgentId.set(agentId, moved)
+    release(held)
+  }
 
   /** A child that goes idle before its first step never uses its reservation: free it. */
   function releaseUnusedReservations(agentId: string): void {
@@ -1671,7 +1800,11 @@ export function apply(ctx: Context, config: Config = {}): void {
   ctx.on('agent/pre-step', async (info, next) => {
     const agentId = String(info.agent.id)
     if (delegationDepthOf(info.agent) === 0) return next()
-    if (activeTurnsByAgentId.has(agentId)) return next()
+    const current = activeTurnsByAgentId.get(agentId)
+    if (current !== undefined) {
+      await movePermit(agentId, current, laneFor(providerOf(info.agent)), info.signal, delegationDepthOf(info.agent))
+      return next()
+    }
 
     const run = [...startsByRunId.values()].find(
       (candidate) => candidate.local && candidate.agentId === agentId && candidate.lease === undefined,
@@ -1739,6 +1872,8 @@ export function apply(ctx: Context, config: Config = {}): void {
     releaseUnusedReservations(agentId)
     for (const lane of lanes.values()) lane.baton.release(agentId)
     batonLaneOf.delete(agentId)
+    // Going idle may leave every lane quiet: adopt a pending providers edit now.
+    providersNow()
   })
 
   ctx.on('agent/disposed', (info) => {
@@ -1861,11 +1996,14 @@ export function apply(ctx: Context, config: Config = {}): void {
   mountRpcChannel(ctx, CHANNEL, async (endpoint, payload) => {
     switch (endpoint) {
       case 'workspaces':
+        providersNow()
         return {
           ok: true,
           value: {
             paused: settings.pausedPaths().map((path) => ({ path, key: projectKey(path) })),
             workspaces: workspaceRows(),
+            // A providers edit waits for running agents before it applies.
+            providersPending,
           },
         }
       case 'workspaceOf': {

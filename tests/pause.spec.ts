@@ -718,3 +718,176 @@ describe('checkup fixes', () => {
     status(ctx, root, 'idle')
   })
 })
+
+/** One model step whose request reports `provider`. */
+function modelStep(ctx: Context, a: Agent, entered: string[], provider: string): Promise<PreStepDecision> {
+  status(ctx, a, 'running')
+  return agentEvents(ctx, a).waterfall(
+    'agent/pre-step',
+    { messages: [], turn: 1, step: 1, signal: new AbortController().signal },
+    async () => {
+      await agentEvents(ctx, a).waterfall(
+        'agent/request',
+        { turn: 1, step: 1, signal: new AbortController().signal },
+        () => Promise.resolve({ provider, model: 'm' } as never),
+      )
+      entered.push(String(a.id))
+      return { kind: 'enter', messages: [] }
+    },
+  )
+}
+
+describe('live settings edits', () => {
+  it('applies a providers edit once no lane holds work, never splitting a lane (#2)', async () => {
+    const ctx = new Context()
+    const providers = live<Record<string, unknown>>({})
+    apply(ctx, {
+      maxConcurrentSubagents: 1,
+      queueTimeoutMs: 5_000,
+      pendingReservationMs: 1,
+      providers: providers as never,
+    })
+    const a = agent('a', 0, { cwd: ALPHA, provider: 'pa' })
+    const entered: string[] = []
+    const first = openTool(ctx, a, 'subagent', () => {
+      entered.push('first')
+    })
+    await flush()
+    providers.set({ pa: { maxConcurrentSubagents: 1 } })
+    const second = openTool(ctx, a, 'subagent', () => {
+      entered.push('second')
+    })
+    await sleep(20)
+    assert.deepStrictEqual(entered, ['first'])
+    first.finish()
+    await first.done
+    await sleep(5)
+    assert.deepStrictEqual(entered, ['first', 'second'])
+    second.finish()
+    await second.done
+    status(ctx, a, 'idle')
+    // Quiet now: the edit applies, and provider pa gets its own lane with limit 1.
+    const third = openTool(ctx, a, 'subagent', () => {
+      entered.push('third')
+    })
+    await flush()
+    const fourth = openTool(ctx, a, 'subagent', () => {
+      entered.push('fourth')
+    })
+    await sleep(20)
+    assert.deepStrictEqual(entered.slice(2), ['third'])
+    third.finish()
+    await third.done
+    await sleep(5)
+    fourth.finish()
+    await fourth.done
+  })
+
+  it('does not flip a busy lane when a providers edit re-derives its baton (#3)', async () => {
+    const ctx = new Context()
+    const providers = live<Record<string, unknown>>({ a: { baton: true }, b: { lane: 'a', baton: false } })
+    apply(ctx, { baton: true, lendAfterMs: 3_600_000, providers: providers as never })
+    const x = agent('x', 0, { cwd: ALPHA, provider: 'a' })
+    const y = agent('y', 0, { cwd: BETA, provider: 'b' })
+    const z = agent('z', 0, { cwd: GAMMA, provider: 'b' })
+    const entered: string[] = []
+    await step(ctx, x, entered)
+    const xTool = longTool(ctx, x)
+    const yStep = step(ctx, y, entered)
+    const zStep = step(ctx, z, entered)
+    await flush()
+    providers.set({ b: { lane: 'a', baton: false } })
+    xTool.finish()
+    await xTool.done
+    const xNext = step(ctx, x, entered)
+    await xNext
+    await sleep(10)
+    assert.deepStrictEqual(entered, ['x', 'x'])
+    status(ctx, x, 'idle')
+    await yStep
+    await sleep(10)
+    assert.deepStrictEqual(entered, ['x', 'x', 'y'])
+    status(ctx, y, 'idle')
+    await zStep
+    status(ctx, z, 'idle')
+  })
+
+  it('admits a queued delegation when the limit is raised, with no other activity (#6)', async () => {
+    const ctx = new Context()
+    const limit = live(1)
+    apply(ctx, { maxConcurrentSubagents: limit as never, queueTimeoutMs: 5_000 })
+    const a = agent('a', 0, { cwd: ALPHA })
+    const b = agent('b', 0, { cwd: BETA })
+    const entered: string[] = []
+    const first = openTool(ctx, a, 'subagent', () => {
+      entered.push('first')
+    })
+    await flush()
+    const second = openTool(ctx, b, 'subagent', () => {
+      entered.push('second')
+    })
+    await flush()
+    limit.set(4)
+    await sleep(1_300)
+    assert.deepStrictEqual(entered, ['first', 'second'])
+    first.finish()
+    second.finish()
+    await Promise.all([first.done, second.done])
+  })
+
+  it('moves a child turn permit to the lane of the provider it switched to (#7)', async () => {
+    const ctx = new Context()
+    const providers = { pa: { maxConcurrentSubagents: 1 }, pb: { maxConcurrentSubagents: 1 } }
+    apply(ctx, { maxConcurrentSubagents: 4, queueTimeoutMs: 5_000, providers })
+    const root = agent('root', 0, { cwd: ALPHA, provider: 'pa' })
+    const child = agent('child', 1, { cwd: ALPHA, provider: 'pa' })
+    const entered: string[] = []
+    await delegate(ctx, root, 'r', 'child', entered)
+    await modelStep(ctx, child, entered, 'pb')
+    // The next step of the same turn moves the permit from pa to pb.
+    await modelStep(ctx, child, entered, 'pb')
+    const onA = openTool(ctx, agent('pa-user', 0, { cwd: BETA, provider: 'pa' }), 'subagent', () => {
+      entered.push('a-probe')
+    })
+    const onB = openTool(ctx, agent('pb-user', 0, { cwd: GAMMA, provider: 'pb' }), 'subagent', () => {
+      entered.push('b-probe')
+    })
+    await sleep(20)
+    assert.deepStrictEqual(entered.slice(-1), ['a-probe'])
+    status(ctx, child, 'idle')
+    endRun(ctx, 'r', 'child')
+    await sleep(5)
+    assert.deepStrictEqual(entered.slice(-2), ['a-probe', 'b-probe'])
+    onA.finish()
+    onB.finish()
+    await Promise.all([onA.done, onB.done])
+  })
+
+  it("gives a lane with no entry of its own the strictest of its providers' settings (#16)", async () => {
+    const ctx = new Context()
+    const providers = {
+      // The first by name states the looser limit: the stricter one must win.
+      'gpu-alt': { lane: 'shared', maxConcurrentSubagents: 4 },
+      'gpu-alt2': { lane: 'shared', maxConcurrentSubagents: 1 },
+      // A chain: gpu-chain follows gpu-alt, which follows shared.
+      'gpu-chain': { lane: 'gpu-alt' },
+    }
+    apply(ctx, { maxConcurrentSubagents: 8, queueTimeoutMs: 5_000, pendingReservationMs: 1, providers })
+    const entered: string[] = []
+    const one = openTool(ctx, agent('u1', 0, { cwd: ALPHA, provider: 'gpu-alt2' }), 'subagent', () => {
+      entered.push('one')
+    })
+    await flush()
+    const two = openTool(ctx, agent('u2', 0, { cwd: BETA, provider: 'gpu-chain' }), 'subagent', () => {
+      entered.push('two')
+    })
+    await sleep(20)
+    assert.deepStrictEqual(entered, ['one'])
+    one.finish()
+    await one.done
+    await sleep(5)
+    assert.deepStrictEqual(entered, ['one', 'two'])
+    two.finish()
+    await two.done
+  })
+})

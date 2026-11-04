@@ -131,7 +131,9 @@ Provider ids that point at the same server must share a lane (`lane:`),
 otherwise they interleave on its single slot. A shared lane takes its
 settings from the provider it is named for (`my-llamacpp` above). If that
 provider is not listed itself, it still runs on the lane, and the lane takes
-its settings from the first of its other providers by name.
+the strictest setting its other providers state: the lowest limit, the longest
+lend delay, and the baton on if any of them turns it on. A `lane:` may point
+at a provider that itself follows another; the chain is followed to its end.
 
 - The names are your dsh provider ids (the `provider` in your model routes).
 - An agent's lane is the provider its last model request used. Before its
@@ -142,7 +144,13 @@ its settings from the first of its other providers by name.
 - The baton is handed to a child only when parent and child share a lane, so
   a parent on one GPU keeps working while its child runs on another.
 - An agent that switches model mid-session moves to the new lane at its next
-  request.
+  request. A child in the middle of a turn moves its pool permit there at its
+  next step.
+- A change to which providers are listed, which lane each one uses, or a
+  lane's baton applies once no agent holds or waits for a permit or a baton,
+  so in-flight work is never split across two lanes. Until then the settings
+  page says the change is waiting. Per-provider limits and lend delays apply
+  at once.
 
 On the settings page, the **Providers** section lists the providers from your
 model catalog. Switch on the ones that run on a single-slot local server, pick
@@ -277,8 +285,8 @@ they apply at once.
 
 Changes apply live, without restarting the profile:
 
-- A raised limit admits queued calls on the next agent activity (a step or a
-  tool call); a lowered one admits no new work until enough has finished.
+- A raised limit admits queued calls within about a second; a lowered one
+  admits no new work until enough has finished.
 - Switching the baton off lets every agent waiting for it continue. Switching
   it on starts fresh: the next agent to step takes the baton.
 - New delegation tool names count from the next call.
