@@ -48,6 +48,12 @@ window.__ModuleLoader__.load({
       catalogUnavailable: 'The provider list is not available here; use Edit as text.',
       refresh: 'Refresh',
       advanced: 'Edit as text',
+      providersPending:
+        'A change to the providers list is waiting: it applies once no agent holds or waits for a slot, so running work is never split across two lanes.',
+      providersTextInvalid:
+        'The provider text below has an error. Fix it under "Edit as text" to use the switches again.',
+      sharedBy: 'Server for {names}',
+      sharedByLocked: 'Other providers run on this server. Switch them off or point them elsewhere first.',
       limitsTitle: 'Limits',
       maxConcurrent: 'Maximum concurrent subagents',
       maxConcurrentHint:
@@ -123,6 +129,10 @@ window.__ModuleLoader__.load({
       catalogUnavailable: '此处无法获取提供方列表，请使用“以文本编辑”。',
       refresh: '刷新',
       advanced: '以文本编辑',
+      providersPending: '提供方列表的更改正在等待：没有代理占用或等待槽位时才会生效，以免运行中的工作被拆到两道。',
+      providersTextInvalid: '下方的提供方文本有误。请在“以文本编辑”中修正后再使用开关。',
+      sharedBy: '{names} 的服务器',
+      sharedByLocked: '其他提供方运行在此服务器上。请先关闭它们或改为其他服务器。',
       limitsTitle: '限制',
       maxConcurrent: '最大并发子代理数',
       maxConcurrentHint: '同时存活的子运行和回合数，不含根代理。开启接力棒模式时请保持大于 1，以允许嵌套子代理。',
@@ -319,9 +329,36 @@ window.__ModuleLoader__.load({
     }
 
     /** The lane root a provider's baton belongs to. */
+    /** The lane root a provider's baton belongs to: its `lane` chain followed to the end, as the host does. */
     function laneRoot(map, id) {
-      var entry = map[id]
-      return entry && typeof entry.lane === 'string' && entry.lane !== id ? entry.lane : id
+      var current = id
+      var seen = new Set([current])
+      for (;;) {
+        const entry = Object.hasOwn(map, current) ? map[current] : undefined
+        const next = entry && typeof entry.lane === 'string' ? entry.lane : undefined
+        if (next === undefined || next === current || seen.has(next)) return current
+        seen.add(next)
+        current = next
+      }
+    }
+
+    /** Providers other than `root` whose lane is `root`. */
+    function followersOf(map, root) {
+      return Object.keys(map).filter((name) => name !== root && laneRoot(map, name) === root)
+    }
+
+    /** A lane root's settings: its own entry, else the strictest its followers state (as the host reads them). */
+    function laneEntry(map, root) {
+      if (Object.hasOwn(map, root) && laneRoot(map, root) === root) return map[root]
+      var merged = {}
+      var followers = followersOf(map, root)
+      var limits = followers.map((name) => map[name].maxConcurrentSubagents).filter((v) => typeof v === 'number')
+      var lends = followers.map((name) => map[name].lendAfterMs).filter((v) => typeof v === 'number')
+      var batons = followers.map((name) => map[name].baton).filter((v) => typeof v === 'boolean')
+      if (limits.length > 0) merged.maxConcurrentSubagents = Math.min(...limits)
+      if (lends.length > 0) merged.lendAfterMs = Math.max(...lends)
+      if (batons.length > 0) merged.baton = batons.includes(true)
+      return merged
     }
 
     function withProvider(map, id) {
@@ -330,13 +367,17 @@ window.__ModuleLoader__.load({
       return next
     }
 
-    /** Turn a provider off; providers that shared its server get their own lane. */
+    /** Turn a provider off; providers that pointed at it follow its own server, or get their own lane. */
     function withoutProvider(map, id) {
+      var root = laneRoot(map, id)
       var next = {}
       for (var name of Object.keys(map)) {
         if (name === id) continue
         const entry = Object.assign({}, map[name])
-        if (entry.lane === id) delete entry.lane
+        if (entry.lane === id) {
+          if (root !== id) entry.lane = root
+          else delete entry.lane
+        }
         next[name] = entry
       }
       return next
@@ -349,7 +390,8 @@ window.__ModuleLoader__.load({
       if (root === '' || root === id) delete entry.lane
       else {
         entry.lane = root
-        next = withProvider(next, root)
+        // A listed or already-followed root stands as a lane as it is; a new one gets an entry.
+        if (!Object.hasOwn(next, root) && followersOf(next, root).length === 0) next = withProvider(next, root)
         // Providers that shared this one's server now follow the new root.
         for (var name of Object.keys(next)) {
           if (name !== id && next[name].lane === id) next[name] = Object.assign({}, next[name], { lane: root })
@@ -360,7 +402,9 @@ window.__ModuleLoader__.load({
     }
 
     function withLimit(map, id, text) {
-      var next = withProvider(map, id)
+      // A lane root without its own entry gets one that keeps the settings it had.
+      var seeded = Object.hasOwn(map, id) ? map[id] : laneEntry(map, id)
+      var next = Object.assign({}, map, { [id]: seeded })
       var entry = Object.assign({}, next[id])
       var trimmed = text.trim()
       if (trimmed === '') delete entry.maxConcurrentSubagents
@@ -409,9 +453,10 @@ window.__ModuleLoader__.load({
 
     var CATALOG_TIMEOUT_MS = 15000
 
-    function ProvidersEditor(react, ui, catalog, actions) {
+    function ProvidersEditor(react, ui, catalog, actions, list) {
       var h = react.createElement
       var hint = { margin: 0, fontSize: '12px', lineHeight: 1.5, color: 'var(--dsw-alias-label-tertiary)' }
+      var error = Object.assign({}, hint, { color: 'var(--dsw-alias-label-error, #d9534f)' })
       var row = {
         display: 'grid',
         gridTemplateColumns: 'minmax(0,1fr) auto',
@@ -442,14 +487,32 @@ window.__ModuleLoader__.load({
       return function Providers(props) {
         var t = props.t
         var listing = react.useSyncExternalStore(catalog.subscribe, catalog.getSnapshot)
+        var pending = react.useSyncExternalStore(list.subscribe, list.getSnapshot).providersPending === true
+        // Limit text the user typed that is not a valid limit, by provider, shown with an error.
+        var draftState = react.useState({})
+        var drafts = draftState[0]
+        var setDrafts = draftState[1]
         var map = props.text.trim() === '' ? {} : parseLanes(props.text)
-        if (map === undefined) return null
+        var pendingNote = pending ? h('p', { style: hint }, t('providersPending')) : null
+        // The text has an error: the switches would discard it, so point at the text box instead.
+        if (map === undefined) return h('div', null, pendingNote, h('p', { style: error }, t('providersTextInvalid')))
         var names = new Map()
         for (var group of listing.groups) names.set(group.id, group.name || group.id)
         var ids = [...names.keys()]
         for (var id of Object.keys(map)) if (!names.has(id)) ids.push(id)
+        // A lane root nobody lists still stands for a server: show it.
+        for (var name of Object.keys(map)) {
+          const root = laneRoot(map, name)
+          if (!ids.includes(root)) ids.push(root)
+        }
         var write = (next) => {
           if (next !== undefined) actions.edit('providers', formatLanes(next))
+        }
+        var setDraft = (providerId, text) => {
+          var next = Object.assign({}, drafts)
+          if (text === undefined) delete next[providerId]
+          else next[providerId] = text
+          setDrafts(next)
         }
 
         var status = null
@@ -474,18 +537,30 @@ window.__ModuleLoader__.load({
           )
         else if (listing.partial) status = h('p', { style: hint }, t('catalogPartial'))
 
+        var nameOf = (providerId) => names.get(providerId) || providerId
+
         return h(
           'div',
           null,
           h('p', { style: hint }, t('providersIntro')),
+          pendingNote,
           status,
           ids.map((id) => {
-            var on = Object.hasOwn(map, id)
-            var entry = map[id] || {}
+            var followers = followersOf(map, id)
+            var isRoot = laneRoot(map, id) === id
+            // Limited when listed, or when another provider uses it as its server.
+            var on = Object.hasOwn(map, id) || (isRoot && followers.length > 0)
+            var entry = isRoot ? laneEntry(map, id) : map[id] || {}
             var roots = ids.filter(
-              (other) => other !== id && Object.hasOwn(map, other) && laneRoot(map, other) === other,
+              (other) =>
+                other !== id &&
+                laneRoot(map, other) === other &&
+                (Object.hasOwn(map, other) || followersOf(map, other).length > 0) &&
+                // Never offer a provider that runs on this one's server.
+                !followersOf(map, id).includes(other),
             )
             var label = names.has(id) ? names.get(id) : `${id} (${t('notInCatalog')})`
+            var draft = Object.hasOwn(drafts, id) ? drafts[id] : undefined
             return h(
               'div',
               { key: id, style: row },
@@ -494,11 +569,16 @@ window.__ModuleLoader__.load({
                 { style: { minWidth: 0 } },
                 h('div', { style: { fontSize: '13px', color: 'var(--dsw-alias-label-primary)' } }, label),
                 label !== id ? h('div', { style: hint }, id) : null,
+                // Switching off a server others run on would silently split them off: say why it is locked.
+                isRoot && followers.length > 0
+                  ? h('div', { style: hint }, t('sharedBy', { names: followers.map(nameOf).join(', ') }))
+                  : null,
               ),
               h(ui.Switch, {
                 checked: on,
                 label: `${t('limitProvider')} ${label}`,
-                disabled: props.disabled,
+                disabled: props.disabled || (isRoot && followers.length > 0),
+                title: isRoot && followers.length > 0 ? t('sharedByLocked') : undefined,
                 onChange: (next) => write(next ? withProvider(map, id) : withoutProvider(map, id)),
               }),
               on
@@ -514,14 +594,14 @@ window.__ModuleLoader__.load({
                         {
                           style: control,
                           disabled: props.disabled,
-                          value: laneRoot(map, id) === id ? '' : laneRoot(map, id),
+                          value: isRoot ? '' : laneRoot(map, id),
                           onChange: (event) => write(withLane(map, id, event.target.value)),
                         },
                         h('option', { value: '' }, t('ownServer')),
-                        roots.map((root) => h('option', { key: root, value: root }, names.get(root) || root)),
+                        roots.map((other) => h('option', { key: other, value: other }, nameOf(other))),
                       ),
                     ),
-                    laneRoot(map, id) === id
+                    isRoot
                       ? h(
                           'label',
                           null,
@@ -531,12 +611,23 @@ window.__ModuleLoader__.load({
                             inputMode: 'numeric',
                             disabled: props.disabled,
                             placeholder: t('providerLimitDefault'),
+                            'aria-invalid': draft !== undefined,
                             value:
-                              typeof entry.maxConcurrentSubagents === 'number'
-                                ? String(entry.maxConcurrentSubagents)
-                                : '',
-                            onChange: (event) => write(withLimit(map, id, event.target.value)),
+                              draft !== undefined
+                                ? draft
+                                : typeof entry.maxConcurrentSubagents === 'number'
+                                  ? String(entry.maxConcurrentSubagents)
+                                  : '',
+                            onChange: (event) => {
+                              var next = withLimit(map, id, event.target.value)
+                              if (next === undefined) setDraft(id, event.target.value)
+                              else {
+                                setDraft(id, undefined)
+                                write(next)
+                              }
+                            },
                           }),
+                          draft !== undefined ? h('span', { style: error }, ` ${t('invalidInteger')}`) : null,
                         )
                       : null,
                   )
@@ -558,6 +649,7 @@ window.__ModuleLoader__.load({
     var WORKSPACES_REFRESH_MS = 3000
     var ROUTE_TIMEOUT_MS = 15000
     var LOOKUP_RETRY_MS = 5000
+    var WRITE_RETRY_MS = 1000
 
     /** A folder's workspace key, matched the way the host half matches it. */
     function projectKey(path) {
@@ -654,7 +746,12 @@ window.__ModuleLoader__.load({
             (result) => {
               var value = result?.ok ? result.value : undefined
               if (value && Array.isArray(value.workspaces))
-                settle({ status: 'ready', rows: value.workspaces, message: '' })
+                settle({
+                  status: 'ready',
+                  rows: value.workspaces,
+                  message: '',
+                  providersPending: value.providersPending === true,
+                })
               else
                 settle({
                   status: 'error',
@@ -695,7 +792,14 @@ window.__ModuleLoader__.load({
         if (current.status !== 'ready' || !current.writable) return Promise.resolve(false)
         var next = withPaused(pausedList(current), path, paused)
         if (next === undefined) return Promise.resolve(true)
-        return form.set('pausedWorkspaces', next).then((ok) => (ok || retried ? ok : write(path, paused, true)))
+        return form.set('pausedWorkspaces', next).then(
+          (ok) => (ok || retried ? ok : write(path, paused, true)),
+          // A transport failure gets no recovery read from the form: wait a moment and try once more.
+          (error) =>
+            retried
+              ? Promise.reject(error)
+              : new Promise((resolve) => setTimeout(resolve, WRITE_RETRY_MS)).then(() => write(path, paused, true)),
+        )
       }
       var control = {
         subscribe: (listener) => {
@@ -765,6 +869,8 @@ window.__ModuleLoader__.load({
         for (var timer of retries.values()) clearTimeout(timer)
         retries.clear()
       }
+      // How many mounted composers show each chat; only those are asked about again.
+      var watched = new Map()
       var lookup = {
         subscribe: (listener) => {
           listeners.add(listener)
@@ -774,6 +880,20 @@ window.__ModuleLoader__.load({
           }
         },
         getSnapshot: () => found,
+        /** A composer shows this chat: look it up, and keep asking while it is unknown. */
+        watch: (sessionId) => {
+          watched.set(sessionId, (watched.get(sessionId) ?? 0) + 1)
+          lookup.want(sessionId)
+          return () => {
+            const left = (watched.get(sessionId) ?? 1) - 1
+            if (left > 0) watched.set(sessionId, left)
+            else {
+              watched.delete(sessionId)
+              clearTimeout(retries.get(sessionId))
+              retries.delete(sessionId)
+            }
+          }
+        },
         want: (sessionId, retry) => {
           if (typeof sessionId !== 'string' || sessionId.length === 0 || route.call === undefined) return
           var known = found.get(sessionId)
@@ -785,12 +905,12 @@ window.__ModuleLoader__.load({
           // Ask again later while a composer shows, without waiting for a re-render.
           var missing = () => {
             set(sessionId, { status: 'missing', at: Date.now() })
-            if (listeners.size === 0) return
+            if (listeners.size === 0 || !watched.has(sessionId)) return
             retries.set(
               sessionId,
               setTimeout(() => {
                 retries.delete(sessionId)
-                if (listeners.size > 0) lookup.want(sessionId, true)
+                if (listeners.size > 0 && watched.has(sessionId)) lookup.want(sessionId, true)
               }, LOOKUP_RETRY_MS),
             )
           }
@@ -963,8 +1083,8 @@ window.__ModuleLoader__.load({
         var sessionId = props.sessionId
         var found = react.useSyncExternalStore(lookup.subscribe, lookup.getSnapshot)
         var pause = react.useSyncExternalStore(control.subscribe, control.getSnapshot)
-        // After every render: a lookup that came back empty is retried later.
-        react.useEffect(() => lookup.want(sessionId))
+        // Per chat: switching chats stops the retries for the one left.
+        react.useEffect(() => lookup.watch(sessionId), [sessionId])
         var workspace = found.get(sessionId)?.workspace
         if (workspace === undefined || !pause.writable) return null
         var paused = control.isPaused(pause, workspace.key)
@@ -989,8 +1109,8 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function createCard(react, ui, store, actions, catalog, Workspaces) {
-      var Providers = ProvidersEditor(react, ui, catalog, actions)
+    function createCard(react, ui, store, actions, catalog, Workspaces, list) {
+      var Providers = ProvidersEditor(react, ui, catalog, actions, list)
       var h = react.createElement
       var section = { padding: '16px 0', display: 'grid', gap: '12px', minWidth: 0 }
       var heading = {
@@ -1228,7 +1348,7 @@ window.__ModuleLoader__.load({
         route.set((endpoint, payload) => scope.connection.rpc.call(CHANNEL, endpoint, payload))
         scope.effect(() => () => route.set(undefined), 'subagent-concurrency-limit: workspace route')
       })
-      var Card = createCard(react, ui, store, form.actions(), catalog, WorkspacesEditor(react, ui, list, control))
+      var Card = createCard(react, ui, store, form.actions(), catalog, WorkspacesEditor(react, ui, list, control), list)
 
       // Registered only while the Host serves the entry, so a profile that
       // switched the bundle off shows no form.

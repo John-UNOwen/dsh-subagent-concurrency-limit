@@ -155,7 +155,9 @@ at a provider that itself follows another; the chain is followed to its end.
 On the settings page, the **Providers** section lists the providers from your
 model catalog. Switch on the ones that run on a single-slot local server, pick
 **Shares a server with** for provider ids that point at the same server, and
-optionally set a per-provider subagent limit. **Edit as text** shows the same
+optionally set a per-provider subagent limit. A provider that others share keeps its switch
+locked until they are switched off or pointed elsewhere, so switching it off
+cannot silently split them onto their own servers. **Edit as text** shows the same
 map as one line, for example
 `my-llamacpp: limit=4; my-llamacpp-alt: lane=my-llamacpp; my-other-gpu: limit=2 lend=60000`.
 

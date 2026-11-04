@@ -21,9 +21,16 @@ afterEach(() => {
 })
 
 /** Load the browser bundle with stand-ins for dsh's module loader, React, and UI primitives. */
-function loadClient() {
+function loadClient(options: { providers?: string } = {}) {
+  const edits: [string, string][] = []
   const specs: { field: string }[] = []
   const subscriptions: (() => void)[] = []
+  let hookIndex = 0
+  const effects: { deps?: unknown[]; cleanup?: () => void }[] = []
+  const states: unknown[] = []
+  const beginRender = () => {
+    hookIndex = 0
+  }
   const store = { subscribe: () => () => {}, getSnapshot: () => snapshot }
   const field = (text: string) => ({ text, overridden: false, invalid: false })
   const snapshot = {
@@ -39,7 +46,7 @@ function loadClient() {
     maxConcurrentSubagents: field('4'),
     queueTimeoutMs: field('300000'),
     subagentToolNames: field('subagent'),
-    providers: field(''),
+    providers: field(options.providers ?? ''),
   }
   const ui = {
     SettingsForm: 'SettingsForm',
@@ -53,7 +60,12 @@ function loadClient() {
         return store
       }
       actions() {
-        return { edit: () => {}, resetField: () => {}, save: () => {}, discard: () => {} }
+        return {
+          edit: (name: string, text: string) => edits.push([name, text]),
+          resetField: () => {},
+          save: () => {},
+          discard: () => {},
+        }
       }
     },
   }
@@ -67,8 +79,30 @@ function loadClient() {
       subscriptions.push(subscribe(() => {}))
       return get()
     },
-    useEffect: (effect: () => unknown) => {
-      effect()
+    // Hooks by call order; `beginRender` starts a component's render again at its first hook.
+    useEffect: (effect: () => unknown, deps?: unknown[]) => {
+      const index = hookIndex++
+      const previous = effects[index]
+      if (
+        previous?.deps &&
+        deps &&
+        deps.length === previous.deps.length &&
+        deps.every((d, i) => Object.is(d, previous.deps?.[i]))
+      )
+        return
+      previous?.cleanup?.()
+      const cleanup = effect()
+      effects[index] = { deps, cleanup: typeof cleanup === 'function' ? (cleanup as () => void) : undefined }
+    },
+    useState: (initial: unknown) => {
+      const index = hookIndex++
+      if (!(index in states)) states[index] = typeof initial === 'function' ? (initial as () => unknown)() : initial
+      return [
+        states[index],
+        (next: unknown) => {
+          states[index] = typeof next === 'function' ? (next as (v: unknown) => unknown)(states[index]) : next
+        },
+      ]
     },
   }
   let loaded: { id: string; exports: Record<string, unknown> } | undefined
@@ -91,9 +125,10 @@ function loadClient() {
   /** Unsubscribe every render, as unmounting does; stops the workspace list's refresh. */
   const release = () => {
     for (const off of subscriptions.splice(0)) off()
+    for (const effect of effects.splice(0)) effect?.cleanup?.()
   }
   releases.push(release)
-  return { loaded, specs, release }
+  return { loaded, specs, release, beginRender, edits }
 }
 
 const CATALOG = {
@@ -729,5 +764,149 @@ describe('client composer button', () => {
     await tick()
     assert.strictEqual(locked.component({ t, sessionId: 's1' }), null)
     release()
+  })
+})
+
+describe('client provider editor (checkup)', () => {
+  const CATALOG3 = {
+    ok: true,
+    value: {
+      groups: [
+        { id: 'gpu-a', name: 'GPU A', models: [] },
+        { id: 'gpu-b', name: 'GPU B', models: [] },
+        { id: 'gpu-c', name: 'GPU C', models: [] },
+      ],
+      failures: [],
+    },
+  }
+
+  async function providersOf(text: string) {
+    const client = loadClient({ providers: text })
+    const { registrations } = apply(client.loaded, CATALOG3)
+    await tick()
+    const card = registrations[0]?.component
+    assert.ok(card)
+    const page = card({ t, view: 'page' })
+    const [providers] = findAll(page, (el) => typeof el.type === 'function' && el.props?.text !== undefined)
+    assert.ok(providers)
+    const render = () => {
+      client.beginRender()
+      return (providers.type as (props: unknown) => unknown)(providers.props) as Element
+    }
+    render()
+    await tick()
+    return { render, edits: client.edits }
+  }
+
+  it('shows a lane root nobody lists as limited, locked while others use it, with the limit that governs (#8, #9)', async () => {
+    const { render, edits } = await providersOf('gpu-b: lane=gpu-a limit=2')
+    const view = render()
+    const switches = findAll(view, (el) => el.type === 'Switch')
+    const a = switches.find((el) => String(el.props?.label).includes('GPU A'))
+    assert.strictEqual(a?.props?.checked, true)
+    assert.strictEqual(a?.props?.disabled, true)
+    assert.ok(findAll(view, (el) => el.children.includes('sharedBy{"names":"GPU B"}')).length > 0)
+    const [, select] = findAll(view, (el) => el.type === 'select')
+    assert.strictEqual(select?.props?.value, 'gpu-a')
+    assert.ok(findAll(select, (el) => el.type === 'option').some((el) => el.props?.value === 'gpu-a'))
+    const inputs = findAll(view, (el) => el.type === 'input')
+    assert.strictEqual(inputs.length, 1)
+    assert.strictEqual(inputs[0]?.props?.value, '2')
+    // Setting the root's limit gives it an entry; the follower keeps its server.
+    fire(inputs[0], 'onChange', { target: { value: '3' } })
+    assert.deepStrictEqual(edits.at(-1), ['providers', 'gpu-b: lane=gpu-a limit=2; gpu-a: limit=3'])
+  })
+
+  it('follows a lane chain to its end (#8)', async () => {
+    const { render } = await providersOf('gpu-b: lane=gpu-c; gpu-c: lane=gpu-a')
+    const view = render()
+    const selects = findAll(view, (el) => el.type === 'select')
+    assert.deepStrictEqual(
+      selects.map((el) => el.props?.value),
+      ['', 'gpu-a', 'gpu-a'],
+    )
+    for (const select of selects.slice(1))
+      assert.ok(findAll(select, (el) => el.type === 'option').some((el) => el.props?.value === 'gpu-a'))
+  })
+
+  it('keeps a rejected limit on screen with an error and stages nothing (#10)', async () => {
+    const { render, edits } = await providersOf('gpu-a: limit=4')
+    let [input] = findAll(render(), (el) => el.type === 'input')
+    fire(input, 'onChange', { target: { value: '0' } })
+    const view = render()
+    ;[input] = findAll(view, (el) => el.type === 'input')
+    assert.strictEqual(input?.props?.value, '0')
+    assert.strictEqual(input?.props?.['aria-invalid'], true)
+    assert.ok(JSON.stringify(view).includes('invalidInteger'))
+    assert.deepStrictEqual(edits, [])
+    fire(input, 'onChange', { target: { value: '7' } })
+    assert.deepStrictEqual(edits, [['providers', 'gpu-a: limit=7']])
+    ;[input] = findAll(render(), (el) => el.type === 'input')
+    assert.strictEqual(input?.props?.value, '4')
+  })
+
+  it('says the text has an error instead of vanishing (#22)', async () => {
+    const { render } = await providersOf('gpu-a: limit')
+    const view = render()
+    assert.ok(view)
+    assert.ok(JSON.stringify(view).includes('providersTextInvalid'))
+  })
+
+  it('seeds a new root entry with the settings its followers gave the lane', () => {
+    const { loaded } = loadClient()
+    const l = loaded.exports.__lanes as { withLimit(map: unknown, id: string, text: string): unknown }
+    assert.deepStrictEqual(plain(l.withLimit({ b: { lane: 'a', baton: true, lendAfterMs: 5 } }, 'a', '3')), {
+      b: { lane: 'a', baton: true, lendAfterMs: 5 },
+      a: { baton: true, lendAfterMs: 5, maxConcurrentSubagents: 3 },
+    })
+  })
+})
+
+describe('client composer and writes (checkup)', () => {
+  it('stops asking about a chat once the composer shows another (#24)', async (t2) => {
+    t2.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+    const client = loadClient()
+    const route = fakeRoute(ROWS, { 'chat-b': { key: 'c:/work/b', path: 'C:\\Work\\B' } })
+    const button = apply(client.loaded, undefined, { rpc: route.rpc, pauseForm: fakePauseForm([]).form })
+      .registrations[1]
+    assert.ok(button)
+    const render = (sessionId: string) => {
+      client.beginRender()
+      return button.component({ t, sessionId })
+    }
+    render('chat-a')
+    await tick()
+    render('chat-b')
+    await tick()
+    for (let i = 0; i < 3; i++) {
+      t2.mock.timers.tick(5000)
+      await tick()
+    }
+    const asked = (id: string) =>
+      route.calls.filter((call) => (call.payload as { sessionId?: string })?.sessionId === id).length
+    assert.strictEqual(asked('chat-a'), 1)
+    assert.strictEqual(asked('chat-b'), 1)
+  })
+
+  it('retries a pause write once after a transport failure (#25)', async (t2) => {
+    t2.mock.timers.enable({ apis: ['setTimeout'] })
+    const { loaded } = loadClient()
+    const pause = fakePauseForm([])
+    let failures = 1
+    const set = pause.form.set
+    pause.form.set = (field: string, value: unknown) => {
+      if (failures-- > 0) return Promise.reject(new Error('connection lost'))
+      return set(field, value)
+    }
+    const control = (
+      loaded.exports.__workspaces as {
+        createPauseControl(form: unknown): { toggle(path: string, paused: boolean): Promise<boolean> }
+      }
+    ).createPauseControl(pause.form)
+    const result = control.toggle('C:\\Work\\A', true)
+    await tick()
+    t2.mock.timers.tick(1000)
+    assert.strictEqual(await result, true)
+    assert.deepStrictEqual(plain(pause.paused()), ['C:\\Work\\A'])
   })
 })
