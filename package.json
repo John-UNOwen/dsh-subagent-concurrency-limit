@@ -1,15 +1,15 @@
 {
   "name": "dsh-subagent-concurrency-limit",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Limit concurrent DeepSeek Harness subagent turns and delegation runs",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/blauerberg/dsh-subagent-concurrency-limit.git"
+    "url": "git+https://github.com/John-UNOwen/dsh-subagent-concurrency-limit.git"
   },
-  "homepage": "https://github.com/blauerberg/dsh-subagent-concurrency-limit#readme",
+  "homepage": "https://github.com/John-UNOwen/dsh-subagent-concurrency-limit#readme",
   "bugs": {
-    "url": "https://github.com/blauerberg/dsh-subagent-concurrency-limit/issues"
+    "url": "https://github.com/John-UNOwen/dsh-subagent-concurrency-limit/issues"
   },
   "keywords": [
     "deepseek-harness",

@@ -7,7 +7,8 @@
  */
 import type { PluginConfigViewProps } from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
 import type { SettingsForm, SettingsFormModel, SettingsValueField, Switch } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { ConfigForms } from '@deepseek-ai/dsh-client-ui-settings/client'
+import type { ClientConnectionRpc } from '@deepseek-ai/dsh-client-connection/client'
+import type { ConfigForm, ConfigFormSnapshot, ConfigForms } from '@deepseek-ai/dsh-client-ui-settings/client'
 
 /** Fails to compile unless `T` has member `K`. */
 type Has<T, K extends PropertyKey & ([K] extends [keyof T] ? unknown : never)> = K
@@ -26,6 +27,20 @@ export type FormModel = [
 
 /** `ctx.configForms` members the client calls. */
 export type Forms = [Has<ConfigForms, 'get'>, Has<ConfigForms, 'whileServed'>]
+
+/** The pause control's calls on the pause row's form. */
+export type PauseForm = [
+  Has<ConfigForm<unknown>, 'getSnapshot'>,
+  Has<ConfigForm<unknown>, 'subscribe'>,
+  Has<ConfigForm<unknown>, 'set'>,
+  Has<ConfigFormSnapshot<unknown>, 'status'>,
+  Has<ConfigFormSnapshot<unknown>, 'mode'>,
+  Has<ConfigFormSnapshot<unknown>, 'writable'>,
+  Has<ConfigFormSnapshot<unknown>, 'value'>,
+]
+
+/** The workspace route goes through `ctx.connection.rpc.call`. */
+export type Rpc = Has<ClientConnectionRpc, 'call'>
 
 /** The card reads `props.view` and renders only 'summary' or a page. */
 export type View = Has<{ summary: 0; page: 0 }, PluginConfigViewProps['view']>

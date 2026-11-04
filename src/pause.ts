@@ -12,6 +12,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
+import { ownSettingsPage } from './own-page.ts'
 
 export const name = 'subagent-concurrency-pause'
 /** The profile entry id the bundle patch gives this row; the settings namespace. */
@@ -42,6 +43,8 @@ function read(value: Config['pausedWorkspaces']): readonly string[] {
 }
 
 export function apply(ctx: Context, config: Config = {}): void {
+  // The plugin's settings page and the composer button edit this list.
+  ownSettingsPage(ctx)
   let last: readonly string[] = read(config.pausedWorkspaces)
   const source: PauseSource = Object.freeze({
     pausedPaths(): readonly string[] {

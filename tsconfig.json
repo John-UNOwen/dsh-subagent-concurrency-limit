@@ -11,7 +11,8 @@
     "declarationMap": true,
     "skipLibCheck": true,
     "types": ["node"],
-    "rewriteRelativeImportExtensions": true
+    "rewriteRelativeImportExtensions": true,
+    "stripInternal": true
   },
   "include": ["src"]
 }

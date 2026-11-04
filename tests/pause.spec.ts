@@ -891,3 +891,105 @@ describe('live settings edits', () => {
     await two.done
   })
 })
+
+describe('housekeeping fixes', () => {
+  it('parks a paused child that was handed the baton before its first step (#13)', async () => {
+    const ctx = new Context()
+    const paused = live<readonly string[]>([])
+    apply(ctx, { baton: true, lendAfterMs: 3_600_000, pausedWorkspaces: paused, pausePollMs: 5 })
+    const root = agent('root', 0, { cwd: ALPHA })
+    const other = agent('other', 0, { cwd: BETA })
+    const entered: string[] = []
+    await step(ctx, root, entered)
+    const t = openTool(ctx, root, 'subagent', () => publish(ctx, 'r', 'c1'))
+    await flush()
+    // The baton now sits with c1, which has not stepped yet.
+    paused.set([ALPHA])
+    const otherStep = step(ctx, other, entered)
+    await sleep(20)
+    assert.deepStrictEqual(entered, ['root', 'other'])
+    await otherStep
+    status(ctx, other, 'idle')
+    paused.set([])
+    t.finish()
+    await t.done
+    endRun(ctx, 'r', 'c1')
+    status(ctx, root, 'idle')
+  })
+
+  it('cancels the queued pool wait of a disposed child (#15)', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 1, queueTimeoutMs: 5_000 })
+    const root = agent('root', 0, { cwd: ALPHA })
+    const child = agent('child', 1, { cwd: ALPHA })
+    const entered: string[] = []
+    const holder = openTool(ctx, root, 'subagent', () => {
+      entered.push('holder')
+    })
+    await flush()
+    // A child published outside any delegation queues for its first turn.
+    publish(ctx, 'loose', 'child')
+    const childStep = step(ctx, child, entered).then(
+      () => 'ran',
+      (error: Error) => error.message,
+    )
+    await flush()
+    ctx.emit(ctx as never, 'agent/disposed', { agent: child })
+    assert.match(await childStep, /disposed/)
+    holder.finish()
+    await holder.done
+    await sleep(5)
+    assert.deepStrictEqual(entered, ['holder'])
+  })
+
+  it('opts both entries out of a generated settings page (#18)', async () => {
+    const { Service } = await import('@deepseek-ai/cordis')
+    const policies: unknown[] = []
+    class FakeSettings extends Service {
+      constructor(ctx: Context) {
+        super(ctx, 'settings')
+      }
+      configure(policy: unknown, owner?: unknown) {
+        policies.push({ policy, owned: owner !== undefined })
+        return () => {}
+      }
+    }
+    const ctx = new Context()
+    await ctx.plugin(FakeSettings)
+    await ctx.plugin({ name: 'main', apply: (scope: Context) => apply(scope, {}) })
+    await ctx.plugin({ name: 'pause', apply: (scope: Context) => pauseRow.apply(scope, {}) })
+    await flush()
+    assert.deepStrictEqual(policies, [
+      { policy: { auto: false }, owned: true },
+      { policy: { auto: false }, owned: true },
+    ])
+  })
+
+  it('reads no session log while no provider is listed (#27)', async () => {
+    const ctx = new Context()
+    apply(ctx, { baton: true })
+    let reads = 0
+    const a = {
+      ...agent('a', 0, { cwd: ALPHA }),
+      session: {
+        header: { cwd: ALPHA },
+        seq: 20_000,
+        eventAt: () => {
+          reads++
+          return undefined
+        },
+      },
+    } as unknown as Agent
+    const entered: string[] = []
+    await step(ctx, a, entered)
+    assert.strictEqual(reads, 0)
+    status(ctx, a, 'idle')
+  })
+
+  it('keeps internal options out of the published types (#17)', async () => {
+    const { readFileSync } = await import('node:fs')
+    const types = readFileSync(new URL('../lib/index.d.ts', import.meta.url), 'utf8')
+    for (const name of ['pausedWorkspaces', 'pausePollMs', 'pendingReservationMs'])
+      assert.ok(!types.includes(name), name)
+  })
+})

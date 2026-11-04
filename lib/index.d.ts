@@ -37,22 +37,6 @@ export interface Config {
      * covers every agent. When not empty, unlisted providers are not limited.
      */
     providers?: Live<Readonly<Record<string, ProviderConfig>>>;
-    /**
-     * Paused workspaces (session working folders). An agent of a paused
-     * workspace finishes its current model call and tool calls, then waits
-     * before its next model request; with the baton on it gives the baton up.
-     * Paths match case- and slash-insensitively; subagents belong to their
-     * parent's workspace. Removing a path puts the workspace back in the queue.
-     *
-     * Normally set on the separate pause row (`subagent-concurrency-pause`,
-     * inserted by the bundle patch), which the settings page and the composer
-     * button write; this option is used only when that row is not mounted.
-     */
-    pausedWorkspaces?: Live<readonly string[]>;
-    /** Internal: how often pause changes are re-checked, in milliseconds. */
-    pausePollMs?: Live<number>;
-    /** Internal: how long an unpublished delegation keeps its permit, in milliseconds. */
-    pendingReservationMs?: Live<number>;
 }
 /** One provider lane's overrides. */
 export interface ProviderConfig {

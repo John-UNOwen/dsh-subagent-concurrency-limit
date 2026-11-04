@@ -10,6 +10,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { delegationDepthOf } from '@deepseek-ai/dsh-subagent'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-tools'
+import { ownSettingsPage } from './own-page.ts'
 import { type PauseSource, SERVICE as PAUSE_SERVICE } from './pause.ts'
 import { mountRpcChannel, type RpcChannelResult } from './rpc-channel.ts'
 
@@ -68,11 +69,13 @@ export interface Config {
    * Normally set on the separate pause row (`subagent-concurrency-pause`,
    * inserted by the bundle patch), which the settings page and the composer
    * button write; this option is used only when that row is not mounted.
+   *
+   * @internal
    */
   pausedWorkspaces?: Live<readonly string[]>
-  /** Internal: how often pause changes are re-checked, in milliseconds. */
+  /** @internal How often pause changes are re-checked, in milliseconds. */
   pausePollMs?: Live<number>
-  /** Internal: how long an unpublished delegation keeps its permit, in milliseconds. */
+  /** @internal How long an unpublished delegation keeps its permit, in milliseconds. */
   pendingReservationMs?: Live<number>
 }
 
@@ -236,6 +239,21 @@ class ConcurrencyGate {
     }
   }
 
+  /** Whether `key` holds a permit. */
+  holds(key: object): boolean {
+    return this.active.has(key)
+  }
+
+  /** Drop a queued key without admitting it. */
+  cancel(key: object, reason: unknown): void {
+    const waiter = this.waiters.find((candidate) => candidate.key === key)
+    if (waiter === undefined) return
+    this.waiters.splice(this.waiters.indexOf(waiter), 1)
+    waiter.signal.removeEventListener('abort', waiter.abort)
+    this.clearWaiterTimeout(waiter)
+    waiter.reject(reason)
+  }
+
   /** Admit without queueing. Used by nested delegation to avoid deadlock. */
   tryEnter(key: object, signal: AbortSignal): boolean {
     if (this.active.has(key)) return true
@@ -377,6 +395,10 @@ class Baton {
   private readonly frames = new Map<string, ParkedFrame>()
   /** A counter ordering first asks, tool starts and queue places; clock times can tie. */
   private clock = 0
+  /** Whether the owner has started a step since it got the baton. */
+  private ownerStepping = false
+  /** The owner `ownerStepping` refers to. */
+  private steppingOwner: string | undefined
   private readonly lendAfterMs: () => number
   private readonly projectOf: (id: string) => string | undefined
   private readonly projectPriorityMs: () => number
@@ -405,9 +427,13 @@ class Baton {
     this.inTools.delete(id)
     this.toolSince.delete(id)
     this.toolOrder.delete(id)
-    if (this.owner === id) return
+    if (this.owner === id) {
+      this.ownerStepping = true
+      return
+    }
     if (this.owner === undefined && this.eligible(id) && !this.hasUnpausedFrame()) {
       this.owner = id
+      this.ownerStepping = true
       return
     }
     await new Promise<void>((resolve, reject) => {
@@ -516,6 +542,8 @@ class Baton {
       if (queued >= 0) queue.splice(queued, 1)
       if (queue.length === 0) this.delegated.delete(parent)
     }
+    // Its own queue is unreachable once it is off the stack: its children wait like anyone.
+    this.delegated.delete(id)
     this.removeFromFrames(id)
     if (this.owner !== id) return
     this.lastProject = this.projectOf(id)
@@ -590,9 +618,12 @@ class Baton {
     return (this.inTools.get(id) ?? 0) > 0
   }
 
-  /** Not generating: inside a tool call or held at the pause gate. */
+  /**
+   * Not generating: inside a tool call, held at the pause gate, or an owner
+   * that was handed the baton (a child, a lender) and has not started a step.
+   */
   private atRest(id: string): boolean {
-    return this.busyInTools(id) || this.held.has(id)
+    return this.busyInTools(id) || this.held.has(id) || (id === this.owner && !this.ownerStepping)
   }
 
   private pausedId(id: string): boolean {
@@ -952,8 +983,13 @@ class Baton {
       else this.lend(borrower.waiter.id)
     }
     this.scheduleLend()
+    if (this.owner !== this.steppingOwner) {
+      this.steppingOwner = this.owner
+      this.ownerStepping = false
+    }
     for (const waiter of [...this.waiters]) {
       if (waiter.id !== this.owner) continue
+      this.ownerStepping = true
       this.waiters.splice(this.waiters.indexOf(waiter), 1)
       waiter.signal.removeEventListener('abort', waiter.abort)
       waiter.resolve()
@@ -1299,6 +1335,7 @@ const GLOBAL_LANE = '*'
 
 export function apply(ctx: Context, config: Config = {}): void {
   const settings = resolveConfig(config)
+  ownSettingsPage(ctx)
   ctx.inject([PAUSE_SERVICE], (scope) => {
     settings.usePauseRow((scope as unknown as Record<string, PauseSource>)[PAUSE_SERVICE])
     scope.effect(() => () => settings.usePauseRow(undefined), 'subagent concurrency: pause row')
@@ -1398,6 +1435,8 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   function providerOf(agent: { readonly id: unknown; readonly options?: unknown; readonly session?: unknown }) {
     const id = String(agent.id)
+    // With no provider listed one lane covers everything: the answer is unused.
+    if (Object.keys(providersNow()).length === 0) return undefined
     const raw = (agent.options as { provider?: unknown } | undefined)?.provider
     const fromOptions = typeof raw === 'string' && raw.length > 0 ? raw : undefined
     // A fresh child's session log is seeded from its parent, so before the
@@ -1500,6 +1539,20 @@ export function apply(ctx: Context, config: Config = {}): void {
     }
     activeTurnsByAgentId.set(agentId, moved)
     release(held)
+  }
+
+  /** Child turns queued for a permit, so disposal can cancel the wait. */
+  const queuedTurns = new Map<string, { gate: ConcurrencyGate; lease: object }>()
+  function queueTurn(agentId: string, gate: ConcurrencyGate, lease: object, signal: AbortSignal): Promise<void> {
+    // The same promise as a plain enter, so an admitted turn takes no extra tick.
+    const entering = gate.enter(lease, signal, settings.queueTimeoutMs())
+    if (gate.holds(lease)) return entering
+    queuedTurns.set(agentId, { gate, lease })
+    const done = () => {
+      if (queuedTurns.get(agentId)?.lease === lease) queuedTurns.delete(agentId)
+    }
+    entering.then(done, done)
+    return entering
   }
 
   /** A child that goes idle before its first step never uses its reservation: free it. */
@@ -1831,7 +1884,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         // A root agent's child with no reservation: a later turn, or a child
         // of a tool outside subagentToolNames (subagent_fork, workflow). Its
         // parent holds no permit, so it queues like a root delegation would.
-        await gate.enter(lease, info.signal, settings.queueTimeoutMs())
+        await queueTurn(agentId, gate, lease, info.signal)
       } else if (run !== undefined) {
         // A deeper child with no reservation. Never queue: fail loudly when the
         // pool is full, so the child cannot block the ancestor waiting for it.
@@ -1839,7 +1892,7 @@ export function apply(ctx: Context, config: Config = {}): void {
           throw new Error('subagent concurrency limit exhausted for reservation-less local child turn')
         }
       } else {
-        await gate.enter(lease, info.signal, settings.queueTimeoutMs())
+        await queueTurn(agentId, gate, lease, info.signal)
       }
       if (run?.ended) {
         gate.release(lease)
@@ -1879,6 +1932,11 @@ export function apply(ctx: Context, config: Config = {}): void {
   ctx.on('agent/disposed', (info) => {
     const agentId = String(info.agent.id)
     heldAgents.get(agentId)?.cancel(new Error('agent was disposed while its workspace was paused'))
+    const queued = queuedTurns.get(agentId)
+    if (queued !== undefined) {
+      queuedTurns.delete(agentId)
+      queued.gate.cancel(queued.lease, new Error('agent was disposed while waiting for a subagent slot'))
+    }
     runningAgents.delete(agentId)
     releaseTurn(agentId)
     for (const lane of lanes.values()) lane.baton.disposed(agentId)
