@@ -128,6 +128,40 @@ describe('workspace pause', () => {
     status(ctx, a, 'idle')
   })
 
+  it('does not park an owner that took a free baton while it still generates', async () => {
+    const ctx = new Context()
+    const paused = live<readonly string[]>([])
+    apply(ctx, { baton: true, pausedWorkspaces: paused, pausePollMs: 5 })
+    const a = agent('a', 0, { cwd: ALPHA })
+    const c = agent('c', 0, { cwd: BETA })
+    const d = agent('d', 0, { cwd: GAMMA })
+    const entered: string[] = []
+
+    // a takes the free baton and is mid-request; c queues behind it.
+    await step(ctx, a, entered)
+    const cStep = step(ctx, c, entered)
+    await flush()
+    paused.set([ALPHA])
+    // Another agent queuing re-checks the baton while a still generates.
+    const dStep = step(ctx, d, entered)
+    await sleep(30)
+    // a is still generating: nobody else may run on the same slot.
+    assert.deepStrictEqual(entered, ['a'])
+
+    // At a's next rest the pause takes effect and c runs, then d.
+    const aNext = step(ctx, a, entered)
+    await cStep
+    assert.deepStrictEqual(entered, ['a', 'c'])
+    status(ctx, c, 'idle')
+    await dStep
+    assert.deepStrictEqual(entered, ['a', 'c', 'd'])
+    paused.set([])
+    status(ctx, d, 'idle')
+    await aNext
+    assert.deepStrictEqual(entered, ['a', 'c', 'd', 'a'])
+    status(ctx, a, 'idle')
+  })
+
   it('keeps a paused child before its paused parent after unpause', async () => {
     const ctx = new Context()
     const paused = live<readonly string[]>([])

@@ -348,12 +348,27 @@ window.__ModuleLoader__.load({
         parse: (text) => {
           if (text.trim() === '') return { kind: 'clear' }
           var lanes = parseLanes(text)
-          return lanes === undefined ? undefined : { kind: 'set', value: lanes }
+          // A chain that loops would split one server into several lanes; the host refuses it too.
+          if (lanes === undefined || Object.keys(lanes).some((name) => laneCycles(lanes, name))) return undefined
+          return { kind: 'set', value: lanes }
         },
       }
     }
 
-    /** The lane root a provider's baton belongs to. */
+    /** Whether a provider's `lane` chain comes back to a provider already on it. */
+    function laneCycles(map, id) {
+      var current = id
+      var seen = new Set([current])
+      for (;;) {
+        const entry = Object.hasOwn(map, current) ? map[current] : undefined
+        const next = entry && typeof entry.lane === 'string' ? entry.lane : undefined
+        if (next === undefined || next === current) return false
+        if (seen.has(next)) return true
+        seen.add(next)
+        current = next
+      }
+    }
+
     /** The lane root a provider's baton belongs to: its `lane` chain followed to the end, as the host does. */
     function laneRoot(map, id) {
       var current = id
@@ -412,17 +427,21 @@ window.__ModuleLoader__.load({
     function withLane(map, id, root) {
       var next = withProvider(map, id)
       var entry = Object.assign({}, next[id])
+      var seedRoot = false
       if (root === '' || root === id) delete entry.lane
       else {
         entry.lane = root
         // A listed or already-followed root stands as a lane as it is; a new one gets an entry.
-        if (!Object.hasOwn(next, root) && followersOf(next, root).length === 0) next = withProvider(next, root)
+        seedRoot = !Object.hasOwn(next, root) && followersOf(next, root).length === 0
         // Providers that shared this one's server now follow the new root.
         for (var name of Object.keys(next)) {
           if (name !== id && next[name].lane === id) next[name] = Object.assign({}, next[name], { lane: root })
         }
       }
       next[id] = entry
+      // The new root's entry keeps the settings its followers gave the lane
+      // (as withLimit does): an empty entry would govern the lane with the defaults.
+      if (seedRoot) next[root] = laneEntry(next, root)
       return next
     }
 
@@ -604,7 +623,11 @@ window.__ModuleLoader__.load({
                 label: `${t('limitProvider')} ${label}`,
                 disabled: props.disabled || (isRoot && followers.length > 0),
                 title: isRoot && followers.length > 0 ? t('sharedByLocked') : undefined,
-                onChange: (next) => write(next ? withProvider(map, id) : withoutProvider(map, id)),
+                onChange: (next) => {
+                  // A rejected limit belongs to the row as it was; do not bring it back later.
+                  setDraft(id, undefined)
+                  write(next ? withProvider(map, id) : withoutProvider(map, id))
+                },
               }),
               on
                 ? h(
@@ -620,7 +643,10 @@ window.__ModuleLoader__.load({
                           style: control,
                           disabled: props.disabled,
                           value: isRoot ? '' : laneRoot(map, id),
-                          onChange: (event) => write(withLane(map, id, event.target.value)),
+                          onChange: (event) => {
+                            setDraft(id, undefined)
+                            write(withLane(map, id, event.target.value))
+                          },
                         },
                         h('option', { value: '' }, t('ownServer')),
                         roots.map((other) => h('option', { key: other, value: other }, nameOf(other))),
@@ -756,12 +782,14 @@ window.__ModuleLoader__.load({
         refresh: () => {
           var mine = ++generation
           stop()
+          // Each state keeps the last rows and pending note until a reply replaces them.
+          var kept = { rows: snapshot.rows, providersPending: snapshot.providersPending === true }
           if (route.call === undefined) {
-            set({ status: 'unavailable', rows: snapshot.rows, message: '' })
+            set(Object.assign({ status: 'unavailable', message: '' }, kept))
             return
           }
           if (snapshot.status !== 'ready' && snapshot.status !== 'loading')
-            set({ status: 'loading', rows: snapshot.rows, message: '' })
+            set(Object.assign({ status: 'loading', message: '' }, kept))
           var settle = (next) => {
             if (mine !== generation) return
             set(next)
@@ -778,13 +806,14 @@ window.__ModuleLoader__.load({
                   providersPending: value.providersPending === true,
                 })
               else
-                settle({
-                  status: 'error',
-                  rows: snapshot.rows,
-                  message: String(result?.error?.message ?? result?.error ?? ''),
-                })
+                settle(
+                  Object.assign(
+                    { status: 'error', message: String(result?.error?.message ?? result?.error ?? '') },
+                    kept,
+                  ),
+                )
             },
-            (error) => settle({ status: 'error', rows: snapshot.rows, message: String(error?.message ?? error) }),
+            (error) => settle(Object.assign({ status: 'error', message: String(error?.message ?? error) }, kept)),
           )
         },
       }
@@ -947,6 +976,11 @@ window.__ModuleLoader__.load({
           }, missing)
         },
       }
+      // A lookup skipped or retried while the route was down asks again once it is back.
+      route.subscribe(() => {
+        if (route.call === undefined) return
+        for (var sessionId of watched.keys()) lookup.want(sessionId, true)
+      })
       return lookup
     }
 
@@ -1449,6 +1483,9 @@ window.__ModuleLoader__.load({
       mergeWorkspaces: mergeWorkspaces,
       workspaceStatus: workspaceStatus,
       createPauseControl: createPauseControl,
+      createRoute: createRoute,
+      createWorkspaceList: createWorkspaceList,
+      createWorkspaceLookup: createWorkspaceLookup,
     }
     module.exports.__lanes = {
       parseLanes: parseLanes,

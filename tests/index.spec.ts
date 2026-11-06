@@ -1393,6 +1393,18 @@ describe('provider lanes', () => {
       apply(new Context(), { providers: { 'local-a': { maxConcurrentSubagents: 0 } } })
     }, /providers must map provider names/)
   })
+
+  it('rejects a providers map whose lane chain loops', () => {
+    // a -> b -> a would split one server into two lanes with two batons.
+    assert.throws(() => {
+      apply(new Context(), { providers: { a: { lane: 'b' }, b: { lane: 'a' } } })
+    }, /no lane cycle/)
+    assert.throws(() => {
+      apply(new Context(), { providers: { a: { lane: 'b' }, b: { lane: 'c' }, c: { lane: 'a' } } })
+    }, /no lane cycle/)
+    // A chain that ends, and a provider naming itself, are fine.
+    apply(new Context(), { providers: { a: { lane: 'b' }, b: { lane: 'c' }, c: { lane: 'c' } } })
+  })
 })
 
 function projectAgent(id: string, cwd: string, subagentDepth = 0): Agent {

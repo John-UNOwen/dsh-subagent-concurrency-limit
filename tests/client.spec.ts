@@ -63,7 +63,11 @@ function loadClient(options: { providers?: string } = {}) {
       }
       actions() {
         return {
-          edit: (name: string, text: string) => edits.push([name, text]),
+          edit: (name: string, text: string) => {
+            edits.push([name, text])
+            // Stage the text the way the form does, so the next render shows it.
+            if (Object.hasOwn(snapshot, name)) (snapshot as Record<string, unknown>)[name] = field(text)
+          },
           resetField: () => {},
           save: () => {},
           discard: () => {},
@@ -319,9 +323,13 @@ describe('client provider list', () => {
     map = l.withLane(map, 'b', 'a')
     map = l.withLimit(map, 'a', '3') as Lanes
     assert.strictEqual(l.formatLanes(map), 'a: limit=3; b: lane=a')
-    // Pointing the root elsewhere carries its followers along.
+    // Pointing the root elsewhere carries its followers along; the new root keeps the lane's limit.
     map = l.withLane(map, 'a', 'c')
-    assert.deepStrictEqual(plain(map), { a: { lane: 'c', maxConcurrentSubagents: 3 }, b: { lane: 'c' }, c: {} })
+    assert.deepStrictEqual(plain(map), {
+      a: { lane: 'c', maxConcurrentSubagents: 3 },
+      b: { lane: 'c' },
+      c: { maxConcurrentSubagents: 3 },
+    })
     // Switching a root off frees its followers.
     assert.deepStrictEqual(plain(l.withoutProvider(map, 'c')), { a: { maxConcurrentSubagents: 3 }, b: {} })
     assert.strictEqual(l.withLimit(map, 'a', '0'), undefined)
@@ -795,11 +803,12 @@ describe('client provider editor (checkup)', () => {
     await tick()
     const card = registrations[0]?.component
     assert.ok(card)
-    const page = card({ t, view: 'page' })
-    const [providers] = findAll(page, (el) => typeof el.type === 'function' && el.props?.text !== undefined)
-    assert.ok(providers)
+    // Render from the card each time, so the editor sees the text the last edit staged.
     const render = () => {
       client.beginRender()
+      const page = card({ t, view: 'page' })
+      const [providers] = findAll(page, (el) => typeof el.type === 'function' && el.props?.text !== undefined)
+      assert.ok(providers)
       return (providers.type as (props: unknown) => unknown)(providers.props) as Element
     }
     render()
@@ -850,8 +859,10 @@ describe('client provider editor (checkup)', () => {
     assert.deepStrictEqual(edits, [])
     fire(input, 'onChange', { target: { value: '7' } })
     assert.deepStrictEqual(edits, [['providers', 'gpu-a: limit=7']])
+    // The staged text round-trips: the editor reads back the limit it wrote, and the error is gone.
     ;[input] = findAll(render(), (el) => el.type === 'input')
-    assert.strictEqual(input?.props?.value, '4')
+    assert.strictEqual(input?.props?.value, '7')
+    assert.strictEqual(input?.props?.['aria-invalid'], false)
   })
 
   it('says the text has an error instead of vanishing (#22)', async () => {
@@ -868,6 +879,55 @@ describe('client provider editor (checkup)', () => {
       b: { lane: 'a', baton: true, lendAfterMs: 5 },
       a: { baton: true, lendAfterMs: 5, maxConcurrentSubagents: 3 },
     })
+  })
+
+  it('gives a new server the settings of the provider pointed at it', () => {
+    const { loaded } = loadClient()
+    const l = loaded.exports.__lanes as { withLane(map: unknown, id: string, root: string): unknown }
+    // An empty `one: {}` would govern the lane with the global defaults and drop limit=1 and the baton.
+    assert.deepStrictEqual(plain(l.withLane({ share: { maxConcurrentSubagents: 1, baton: true } }, 'share', 'one')), {
+      share: { lane: 'one', maxConcurrentSubagents: 1, baton: true },
+      one: { maxConcurrentSubagents: 1, baton: true },
+    })
+  })
+
+  it('refuses a lane chain that comes back to itself', () => {
+    const { loaded } = loadClient()
+    const fields = loaded.exports.__fields as {
+      lanesField(field: string): { parse(text: string): unknown }
+    }
+    const field = fields.lanesField('providers')
+    assert.strictEqual(field.parse('a: lane=b; b: lane=a'), undefined)
+    assert.strictEqual(field.parse('a: lane=b; b: lane=c; c: lane=a'), undefined)
+    assert.deepStrictEqual(plain(field.parse('a: lane=b; b: lane=c')), {
+      kind: 'set',
+      value: { a: { lane: 'b' }, b: { lane: 'c' } },
+    })
+  })
+
+  it('drops a rejected limit when its provider is switched off or repointed', async () => {
+    const { render } = await providersOf('gpu-a: limit=4; gpu-b: limit=2')
+    const inputOf = (view: Element, at: number) => findAll(view, (el) => el.type === 'input')[at]
+    const switchOf = (view: Element, name: string) =>
+      findAll(view, (el) => el.type === 'Switch').find((el) => String(el.props?.label).includes(name))
+
+    // Off and on again: the row shows the config, not the old error.
+    fire(inputOf(render(), 0), 'onChange', { target: { value: '0' } })
+    assert.strictEqual(inputOf(render(), 0)?.props?.['aria-invalid'], true)
+    fire(switchOf(render(), 'GPU A'), 'onChange', false)
+    fire(switchOf(render(), 'GPU A'), 'onChange', true)
+    let input = inputOf(render(), 0)
+    assert.strictEqual(input?.props?.value, '')
+    assert.strictEqual(input?.props?.['aria-invalid'], false)
+
+    // Onto another server and back: the same.
+    fire(inputOf(render(), 1), 'onChange', { target: { value: '0' } })
+    const selectOf = (view: Element, at: number) => findAll(view, (el) => el.type === 'select')[at]
+    fire(selectOf(render(), 1), 'onChange', { target: { value: 'gpu-a' } })
+    fire(selectOf(render(), 1), 'onChange', { target: { value: '' } })
+    input = inputOf(render(), 1)
+    assert.strictEqual(input?.props?.value, '2')
+    assert.strictEqual(input?.props?.['aria-invalid'], false)
   })
 })
 
@@ -895,6 +955,61 @@ describe('client composer and writes (checkup)', () => {
       route.calls.filter((call) => (call.payload as { sessionId?: string })?.sessionId === id).length
     assert.strictEqual(asked('chat-a'), 1)
     assert.strictEqual(asked('chat-b'), 1)
+  })
+
+  it('looks a chat up once the route comes back', async () => {
+    const { loaded } = loadClient()
+    const w = loaded.exports.__workspaces as {
+      createRoute(): { set(call: unknown): void }
+      createWorkspaceLookup(route: unknown): {
+        subscribe(listener: () => void): () => void
+        getSnapshot(): Map<string, { status: string }>
+        watch(sessionId: string): () => void
+      }
+    }
+    const route = w.createRoute()
+    const lookup = w.createWorkspaceLookup(route)
+    const off = lookup.subscribe(() => {})
+    // A composer shown before the connection is up asks nothing yet.
+    const stop = lookup.watch('chat-a')
+    assert.strictEqual(lookup.getSnapshot().get('chat-a'), undefined)
+    const fake = fakeRoute(ROWS, { 'chat-a': { key: 'c:/work/a', path: 'C:\Work\A' } })
+    route.set((endpoint: string, payload: unknown) => fake.rpc('/subagent-concurrency-limit', endpoint, payload))
+    await tick()
+    assert.strictEqual(lookup.getSnapshot().get('chat-a')?.status, 'ready')
+    // Dropped and back: a chat already found is not asked about again.
+    route.set(undefined)
+    route.set((endpoint: string, payload: unknown) => fake.rpc('/subagent-concurrency-limit', endpoint, payload))
+    await tick()
+    assert.strictEqual(fake.calls.length, 1)
+    stop()
+    off()
+  })
+
+  it('keeps the pending providers note while the workspace list errors', async () => {
+    const { loaded } = loadClient()
+    const w = loaded.exports.__workspaces as {
+      createRoute(): { set(call: unknown): void }
+      createWorkspaceList(route: unknown): {
+        subscribe(listener: () => void): () => void
+        getSnapshot(): { status: string; providersPending?: boolean }
+        refresh(): void
+      }
+    }
+    const route = w.createRoute()
+    const list = w.createWorkspaceList(route)
+    let reply: unknown = { ok: true, value: { workspaces: [], providersPending: true } }
+    route.set(async () => reply)
+    const off = list.subscribe(() => {})
+    await tick()
+    assert.strictEqual(list.getSnapshot().status, 'ready')
+    assert.strictEqual(list.getSnapshot().providersPending, true)
+    reply = { ok: false, error: { message: 'timed out' } }
+    list.refresh()
+    await tick()
+    assert.strictEqual(list.getSnapshot().status, 'error')
+    assert.strictEqual(list.getSnapshot().providersPending, true)
+    off()
   })
 
   it('retries a pause write once after a transport failure (#25)', async (t2) => {

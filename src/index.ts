@@ -451,12 +451,16 @@ class Baton {
     this.inTools.delete(id)
     this.toolSince.delete(id)
     this.toolOrder.delete(id)
+    // Record whose step it is too, or the next settle() would think the
+    // owner changed and treat a generating owner as at rest.
     if (this.owner === id) {
+      this.steppingOwner = id
       this.ownerStepping = true
       return
     }
     if (this.owner === undefined && this.eligible(id) && !this.hasUnpausedFrame()) {
       this.owner = id
+      this.steppingOwner = id
       this.ownerStepping = true
       return
     }
@@ -1069,7 +1073,7 @@ function isPositiveInteger(value: unknown): value is number {
 
 function isProviderMap(value: unknown): value is Readonly<Record<string, ProviderConfig>> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
-  return Object.entries(value).every(([name, lane]) => {
+  const fieldsValid = Object.entries(value).every(([name, lane]) => {
     if (name.length === 0 || typeof lane !== 'object' || lane === null || Array.isArray(lane)) return false
     const { lane: shared, baton, maxConcurrentSubagents, lendAfterMs } = lane as Record<string, unknown>
     return (
@@ -1079,6 +1083,10 @@ function isProviderMap(value: unknown): value is Readonly<Record<string, Provide
       (lendAfterMs === undefined || (Number.isSafeInteger(lendAfterMs) && (lendAfterMs as number) >= 0))
     )
   })
+  if (!fieldsValid) return false
+  // A `lane` chain that loops would split one server into several lanes.
+  const listed = value as Readonly<Record<string, ProviderConfig>>
+  return Object.keys(listed).every((name) => !laneCycles(listed, name))
 }
 
 function isPathList(value: unknown): value is readonly string[] {
@@ -1163,7 +1171,7 @@ function resolveConfig(config: Config): Settings {
     config.providers,
     {},
     isProviderMap,
-    'providers must map provider names to { baton?, maxConcurrentSubagents?, lendAfterMs? }',
+    'providers must map provider names to { lane?, baton?, maxConcurrentSubagents?, lendAfterMs? } with no lane cycle',
   )
   const paused = liveField<readonly string[]>(
     config.pausedWorkspaces,
@@ -1331,6 +1339,19 @@ function laneSettings(listed: Readonly<Record<string, ProviderConfig>>, lane: st
     ...(limits.length > 0 ? { maxConcurrentSubagents: Math.min(...limits) } : {}),
     ...(lends.length > 0 ? { lendAfterMs: Math.max(...lends) } : {}),
     ...(batons.length > 0 ? { baton: batons.includes(true) } : {}),
+  }
+}
+
+/** Whether a provider's `lane` chain comes back to a provider already on it. */
+function laneCycles(listed: Readonly<Record<string, ProviderConfig>>, provider: string): boolean {
+  let current = provider
+  const seen = new Set<string>([current])
+  for (;;) {
+    const next = Object.hasOwn(listed, current) ? listed[current].lane : undefined
+    if (next === undefined || next === current) return false
+    if (seen.has(next)) return true
+    seen.add(next)
+    current = next
   }
 }
 
@@ -1521,16 +1542,21 @@ export function apply(ctx: Context, config: Config = {}): void {
    * then free the permit.
    */
   const reservationTimers = new Set<ReturnType<typeof setTimeout>>()
+  function forgetPending(agentId: string, reservation: Reservation): void {
+    const pending = pendingByAgentId.get(agentId)
+    const index = pending?.indexOf(reservation) ?? -1
+    if (pending !== undefined && index >= 0) pending.splice(index, 1)
+    if (pending?.length === 0) pendingByAgentId.delete(agentId)
+  }
   function expireReservation(agentId: string, reservation: Reservation): void {
     const timer = setTimeout(() => {
       reservationTimers.delete(timer)
+      // A reservation a deferred publish bound has nothing left to expire,
+      // but it still leaves the pending list.
+      forgetPending(agentId, reservation)
       if (reservation.state !== 'open') return
       reservation.state = 'done'
       release(reservation)
-      const pending = pendingByAgentId.get(agentId)
-      const index = pending?.indexOf(reservation) ?? -1
-      if (pending !== undefined && index >= 0) pending.splice(index, 1)
-      if (pending?.length === 0) pendingByAgentId.delete(agentId)
     }, settings.pendingReservationMs())
     timer.unref?.()
     reservationTimers.add(timer)
@@ -1908,6 +1934,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     }
     const childId = String(info.id)
     const parentId = toolAgent.getStore()
+    if (ownedReservation !== undefined && parentId !== undefined) forgetPending(parentId, ownedReservation)
     const parentProject = parentId === undefined ? undefined : projectByAgent.get(parentId)
     if (parentProject !== undefined && !projectByAgent.has(childId)) projectByAgent.set(childId, parentProject)
     const expected = reservation?.provider ?? (parentId === undefined ? undefined : observedProvider.get(parentId))
