@@ -29,6 +29,11 @@ const DEFAULT_PAUSE_POLL_MS = 1_000
 const LIMIT_POLL_MS = 1_000
 /** How long a successful delegation may wait for its run to be published. */
 const DEFAULT_PENDING_RESERVATION_MS = 10_000
+/** How long an agent may wait for the user's answer before its workspace pauses. */
+const DEFAULT_PAUSE_UNANSWERED_MS = 1_800_000
+/** The dsh tool that waits for the user's answer (dsh-tool-ask-user, default mode). */
+const QUESTION_TOOL = 'ask_user_question'
+
 /** Node fires any longer timer after 1 ms, so every wait is clamped to this. */
 const MAX_TIMER_MS = 2_147_483_647
 
@@ -53,6 +58,14 @@ export interface Config {
    * this long. 0 turns the preference off (plain first come, first served).
    */
   projectPriorityMs?: Live<number>
+  /**
+   * Pause a workspace whose agent has waited this long for the user's answer,
+   * so other workspaces use the model meanwhile; the answer resumes it. 0
+   * turns this off.
+   */
+  pauseUnansweredAfterMs?: Live<number>
+  /** What counts as waiting for the user: `questions` (ask_user_question) or also tool approvals. */
+  pauseUnansweredOn?: Live<'questions' | 'questions-and-approvals'>
   /**
    * Per-provider lanes. Each listed provider gets its own baton and pool;
    * unset fields inherit the top-level ones. When empty, one global lane
@@ -114,6 +127,17 @@ export const Config = Schema.object({
     .max(Number.MAX_SAFE_INTEGER)
     .default(DEFAULT_LEND_AFTER_MS)
     .description('Baton mode: milliseconds the holder may spend in tools before another agent may borrow the baton.')
+    .volatile(),
+  pauseUnansweredAfterMs: Schema.natural()
+    .max(Number.MAX_SAFE_INTEGER)
+    .default(DEFAULT_PAUSE_UNANSWERED_MS)
+    .description(
+      "Pause a workspace whose agent has waited this many milliseconds for the user's answer; the answer resumes it. 0 turns it off.",
+    )
+    .volatile(),
+  pauseUnansweredOn: Schema.union(['questions', 'questions-and-approvals'])
+    .default('questions')
+    .description('What counts as waiting for the answer: questions only, or tool approval prompts too.')
     .volatile(),
   maxConcurrentSubagents: Schema.natural()
     .min(1)
@@ -1026,6 +1050,8 @@ interface Settings {
   baton(): boolean
   lendAfterMs(): number
   projectPriorityMs(): number
+  pauseUnansweredAfterMs(): number
+  pauseUnansweredOn(): 'questions' | 'questions-and-approvals'
   providers(): Readonly<Record<string, ProviderConfig>>
   /** Normalized project keys of the paused workspaces. */
   pausedProjects(): ReadonlySet<string>
@@ -1120,6 +1146,19 @@ function resolveConfig(config: Config): Settings {
     (value): value is number => Number.isSafeInteger(value) && (value as number) >= 0,
     'projectPriorityMs must be a non-negative safe integer',
   )
+  const pauseUnansweredAfterMs = liveField(
+    config.pauseUnansweredAfterMs,
+    DEFAULT_PAUSE_UNANSWERED_MS,
+    (value): value is number => Number.isSafeInteger(value) && (value as number) >= 0,
+    'pauseUnansweredAfterMs must be a non-negative safe integer',
+  )
+  const pauseUnansweredOn = liveField<'questions' | 'questions-and-approvals'>(
+    config.pauseUnansweredOn,
+    'questions',
+    (value): value is 'questions' | 'questions-and-approvals' =>
+      value === 'questions' || value === 'questions-and-approvals',
+    "pauseUnansweredOn must be 'questions' or 'questions-and-approvals'",
+  )
   const providers = liveField<Readonly<Record<string, ProviderConfig>>>(
     config.providers,
     {},
@@ -1161,6 +1200,8 @@ function resolveConfig(config: Config): Settings {
   return {
     pausePollMs,
     pendingReservationMs,
+    pauseUnansweredAfterMs,
+    pauseUnansweredOn,
     pausedPaths,
     usePauseRow(source: PauseSource | undefined) {
       pauseRow = source
@@ -1324,6 +1365,8 @@ interface WorkspaceRow {
   held: number
   /** Running agents inside a tool call or approval, not held. */
   inTool: number
+  /** Paused because an agent has waited too long for the user's answer. */
+  awaitingAnswer: boolean
   /** Agents queued for a baton. */
   waiting: number
   /** Whether one of its agents holds a baton now. */
@@ -1424,7 +1467,7 @@ export function apply(ctx: Context, config: Config = {}): void {
           lendAfterMs: () => live()?.lendAfterMs ?? settings.lendAfterMs(),
           projectOf: (id) => projectByAgent.get(id),
           projectPriorityMs: settings.projectPriorityMs,
-          isPaused: (project) => settings.pausedProjects().has(project),
+          isPaused: (project) => isPausedProject(project),
           pollMs: settings.pausePollMs,
         },
       )
@@ -1594,7 +1637,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   >()
 
   function workspacePaused(project: string | undefined): boolean {
-    return project !== undefined && settings.pausedProjects().has(project)
+    return project !== undefined && isPausedProject(project)
   }
 
   /**
@@ -1689,6 +1732,60 @@ export function apply(ctx: Context, config: Config = {}): void {
     { prepend: true },
   )
 
+  /**
+   * Workspaces paused because one of their agents has waited too long for the
+   * user's answer: project key -> how many such waits are overdue. The answer
+   * (or an abort) ends the wait and lifts the pause, which puts the workspace
+   * back in the queue like a manual resume.
+   */
+  const unanswered = new Map<string, number>()
+  function isPausedProject(project: string): boolean {
+    return settings.pausedProjects().has(project) || (unanswered.get(project) ?? 0) > 0
+  }
+  function refreshBatons(): void {
+    for (const lane of lanes.values()) lane.baton.refresh()
+  }
+  const answerTimers = new Set<ReturnType<typeof setTimeout>>()
+  ctx.effect(
+    () => () => {
+      for (const timer of answerTimers) clearTimeout(timer)
+      answerTimers.clear()
+    },
+    'subagent concurrency answer timers',
+  )
+
+  /** Run a wait for the user's answer; past pauseUnansweredAfterMs its workspace pauses until it ends. */
+  async function awaitUser<T>(agentId: string, kind: 'question' | 'approval', run: () => Promise<T>): Promise<T> {
+    const limit = settings.pauseUnansweredAfterMs()
+    if (limit <= 0 || (kind === 'approval' && settings.pauseUnansweredOn() !== 'questions-and-approvals')) return run()
+    let paused: string | undefined
+    const timer = setTimeout(
+      () => {
+        answerTimers.delete(timer)
+        const project = projectByAgent.get(agentId)
+        if (project === undefined) return
+        paused = project
+        unanswered.set(project, (unanswered.get(project) ?? 0) + 1)
+        refreshBatons()
+      },
+      Math.min(limit, MAX_TIMER_MS),
+    )
+    timer.unref?.()
+    answerTimers.add(timer)
+    try {
+      return await run()
+    } finally {
+      clearTimeout(timer)
+      answerTimers.delete(timer)
+      if (paused !== undefined) {
+        const left = (unanswered.get(paused) ?? 1) - 1
+        if (left > 0) unanswered.set(paused, left)
+        else unanswered.delete(paused)
+        refreshBatons()
+      }
+    }
+  }
+
   /** Open tool calls and approvals per agent, for the workspaces route. */
   const toolDepth = new Map<string, number>()
 
@@ -1728,7 +1825,11 @@ export function apply(ctx: Context, config: Config = {}): void {
   onApproval.call(
     ctx,
     'approval/request',
-    (req, next) => (req?.agent === undefined ? next() : asToolTime(String(req.agent.id), req.signal, next)),
+    (req, next) => {
+      if (req?.agent === undefined) return next()
+      const agentId = String(req.agent.id)
+      return asToolTime(agentId, req.signal, () => awaitUser(agentId, 'approval', next))
+    },
     { prepend: true },
   )
 
@@ -1737,7 +1838,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     async (exec, next) => {
       pumpAll()
       if (exec.agent === undefined) return next()
-      return asToolTime(String(exec.agent.id), undefined, next)
+      const agentId = String(exec.agent.id)
+      if (exec.name === QUESTION_TOOL) return asToolTime(agentId, undefined, () => awaitUser(agentId, 'question', next))
+      return asToolTime(agentId, undefined, next)
     },
     { prepend: true },
   )
@@ -2001,6 +2104,7 @@ export function apply(ctx: Context, config: Config = {}): void {
           running: 0,
           held: 0,
           inTool: 0,
+          awaitingAnswer: (unanswered.get(key) ?? 0) > 0,
           waiting: 0,
           holdsBaton: false,
         }

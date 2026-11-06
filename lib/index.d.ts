@@ -32,6 +32,14 @@ export interface Config {
      */
     projectPriorityMs?: Live<number>;
     /**
+     * Pause a workspace whose agent has waited this long for the user's answer,
+     * so other workspaces use the model meanwhile; the answer resumes it. 0
+     * turns this off.
+     */
+    pauseUnansweredAfterMs?: Live<number>;
+    /** What counts as waiting for the user: `questions` (ask_user_question) or also tool approvals. */
+    pauseUnansweredOn?: Live<'questions' | 'questions-and-approvals'>;
+    /**
      * Per-provider lanes. Each listed provider gets its own baton and pool;
      * unset fields inherit the top-level ones. When empty, one global lane
      * covers every agent. When not empty, unlisted providers are not limited.
@@ -51,6 +59,8 @@ export declare const Config: Schema<Schemastery.ObjectS<NoInfer<{
     baton: Schema<boolean, boolean, "volatile-defined">;
     projectPriorityMs: Schema<number, number, "volatile-defined">;
     lendAfterMs: Schema<number, number, "volatile-defined">;
+    pauseUnansweredAfterMs: Schema<number, number, "volatile-defined">;
+    pauseUnansweredOn: Schema<"questions" | "questions-and-approvals", "questions" | "questions-and-approvals", "volatile-defined">;
     maxConcurrentSubagents: Schema<number, number, "volatile-defined">;
     queueTimeoutMs: Schema<number, number, "volatile-defined">;
     providers: Schema<NoInfer<Record<string, ProviderConfig>>, NoInfer<Record<string, ProviderConfig>>, "volatile-defined">;
@@ -59,6 +69,8 @@ export declare const Config: Schema<Schemastery.ObjectS<NoInfer<{
     baton: Schema<boolean, boolean, "volatile-defined">;
     projectPriorityMs: Schema<number, number, "volatile-defined">;
     lendAfterMs: Schema<number, number, "volatile-defined">;
+    pauseUnansweredAfterMs: Schema<number, number, "volatile-defined">;
+    pauseUnansweredOn: Schema<"questions" | "questions-and-approvals", "questions" | "questions-and-approvals", "volatile-defined">;
     maxConcurrentSubagents: Schema<number, number, "volatile-defined">;
     queueTimeoutMs: Schema<number, number, "volatile-defined">;
     providers: Schema<NoInfer<Record<string, ProviderConfig>>, NoInfer<Record<string, ProviderConfig>>, "volatile-defined">;

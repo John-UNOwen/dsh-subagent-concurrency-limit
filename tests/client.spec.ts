@@ -43,6 +43,8 @@ function loadClient(options: { providers?: string } = {}) {
     baton: field('true'),
     lendAfterMs: field('30000'),
     projectPriorityMs: field('600000'),
+    pauseUnansweredAfterMs: field('1800000'),
+    pauseUnansweredOn: field('questions'),
     maxConcurrentSubagents: field('4'),
     queueTimeoutMs: field('300000'),
     subagentToolNames: field('subagent'),
@@ -219,6 +221,8 @@ describe('client settings page', () => {
         'baton',
         'lendAfterMs',
         'projectPriorityMs',
+        'pauseUnansweredAfterMs',
+        'pauseUnansweredOn',
         'maxConcurrentSubagents',
         'queueTimeoutMs',
         'subagentToolNames',
@@ -691,6 +695,11 @@ describe('client workspaces', () => {
       'statePausing · partInTool{"agents":"oneAgent"} · partFinishing{"agents":"oneAgent"}',
     )
     assert.strictEqual(workspaceStatus(t, row({}), false), 'stateIdle')
+    // Paused by an unanswered question while the switch is off.
+    assert.strictEqual(
+      workspaceStatus(t, row({ running: 1, inTool: 1, awaitingAnswer: true }), false),
+      'statePaused · partInTool{"agents":"oneAgent"} · partAwaitingAnswer',
+    )
     assert.strictEqual(
       workspaceStatus(t, row({ running: 1, holdsBaton: true }), false),
       'stateRunning · oneAgent · partBaton',
@@ -908,5 +917,27 @@ describe('client composer and writes (checkup)', () => {
     t2.mock.timers.tick(1000)
     assert.strictEqual(await result, true)
     assert.deepStrictEqual(plain(pause.paused()), ['C:\\Work\\A'])
+  })
+})
+
+describe('client unanswered-question settings', () => {
+  it('shows the delay and the approvals switch, and stages the switch as a choice', () => {
+    const client = loadClient()
+    const card = apply(client.loaded).registrations[0]?.component
+    assert.ok(card)
+    const page = card({ t, view: 'page' })
+    const text = JSON.stringify(page)
+    assert.ok(text.includes('unansweredTitle') && text.includes('"text":"1800000"'))
+    const toggle = findAll(page, (el) => el.type === 'Switch' && el.props?.label === 'unansweredApprovals')[0]
+    assert.strictEqual(toggle?.props?.checked, false)
+    fire(toggle, 'onChange', true)
+    assert.deepStrictEqual(client.edits.at(-1), ['pauseUnansweredOn', 'questions-and-approvals'])
+    type Spec = { parse(text: string): unknown }
+    const choice = (client.loaded.exports.__fields as { choiceField(f: string, c: string[]): Spec }).choiceField(
+      'pauseUnansweredOn',
+      ['questions', 'questions-and-approvals'],
+    )
+    assert.deepStrictEqual(plain(choice.parse('questions')), { kind: 'set', value: 'questions' })
+    assert.strictEqual(choice.parse('always'), undefined)
   })
 })

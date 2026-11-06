@@ -219,6 +219,25 @@ route the host half serves at `/subagent-concurrency-limit` (`workspaces` and
 authentication. Pausing and resuming write the setting through dsh's settings
 service, which validates and persists it like any other.
 
+### Pausing on an unanswered question
+
+When an agent asks you something (`ask_user_question`) and the question waits
+`pauseUnansweredAfterMs` (default 1800000, 30 minutes) for your answer, its
+workspace pauses by itself, exactly like a manual pause, so other workspaces
+use the model meanwhile. Your answer lifts it: the workspace rejoins the queue
+behind agents already waiting. A manual pause of the same workspace stays.
+
+- `pauseUnansweredOn: questions` (default) counts only questions;
+  `questions-and-approvals` also counts tool approval prompts waiting on you.
+  On the settings page this is the **Count approval prompts too** switch.
+- `0` turns it off. A changed delay applies to questions asked after the
+  change.
+- It needs dsh's default ask mode, where the question waits for the answer.
+  In `timed` mode the tool returns after its own timeout and the agent carries
+  on, so the workspace pauses only if that timeout is longer than the delay.
+- The Workspaces list shows such a workspace as "Paused · waiting for your
+  answer"; its switch stays off, since the pause is not on the list.
+
 ## Install (this fork)
 
 This fork is not on npm. Push it to your GitHub account and install it from

@@ -993,3 +993,114 @@ describe('housekeeping fixes', () => {
       assert.ok(!types.includes(name), name)
   })
 })
+
+describe('pause on an unanswered question', () => {
+  /** An ask_user_question call that waits until `answer` is called. */
+  function question(ctx: Context, a: Agent) {
+    let answer = () => {}
+    const done = tool(
+      ctx,
+      a,
+      () => new Promise<ToolExecutionResult>((resolve) => (answer = () => resolve(result()))),
+      'ask_user_question',
+    )
+    return { done, answer: () => answer() }
+  }
+
+  function approval(ctx: Context, a: Agent) {
+    let answer = () => {}
+    const done = ctx.waterfall(
+      ctx as never,
+      'approval/request' as never,
+      { agent: a, signal: new AbortController().signal } as never,
+      () => new Promise((resolve) => (answer = () => resolve({ decision: 'approve' }))),
+    )
+    return { done, answer: () => answer() }
+  }
+
+  it('pauses the workspace once the question waits too long, and the answer requeues it', async () => {
+    const ctx = new Context()
+    apply(ctx, {
+      baton: true,
+      lendAfterMs: 3_600_000,
+      pauseUnansweredAfterMs: 30,
+      pausePollMs: 5,
+      projectPriorityMs: 0,
+    })
+    const a = agent('a', 0, { cwd: ALPHA })
+    const b = agent('b', 0, { cwd: BETA })
+    const c = agent('c', 0, { cwd: GAMMA })
+    const entered: string[] = []
+    await step(ctx, a, entered)
+    const asked = question(ctx, a)
+    const bStep = step(ctx, b, entered)
+    await sleep(10)
+    // Still inside the limit: the asker keeps the baton.
+    assert.deepStrictEqual(entered, ['a'])
+    await bStep
+    assert.deepStrictEqual(entered, ['a', 'b'])
+    const cStep = step(ctx, c, entered)
+    // The answer lifts the pause; a queues behind c, who was waiting already.
+    asked.answer()
+    await asked.done
+    const aNext = step(ctx, a, entered)
+    status(ctx, b, 'idle')
+    await cStep
+    await sleep(10)
+    assert.deepStrictEqual(entered, ['a', 'b', 'c'])
+    status(ctx, c, 'idle')
+    await aNext
+    assert.deepStrictEqual(entered, ['a', 'b', 'c', 'a'])
+    status(ctx, a, 'idle')
+  })
+
+  it('does nothing for a question answered in time, or with the limit at 0', async () => {
+    for (const limit of [200, 0]) {
+      const ctx = new Context()
+      apply(ctx, { baton: true, lendAfterMs: 3_600_000, pauseUnansweredAfterMs: limit, pausePollMs: 5 })
+      const a = agent('a', 0, { cwd: ALPHA })
+      const b = agent('b', 0, { cwd: BETA })
+      const entered: string[] = []
+      await step(ctx, a, entered)
+      const asked = question(ctx, a)
+      const bStep = step(ctx, b, entered)
+      await sleep(60)
+      assert.deepStrictEqual(entered, ['a'], `limit ${limit}`)
+      asked.answer()
+      await asked.done
+      status(ctx, a, 'idle')
+      await bStep
+      status(ctx, b, 'idle')
+    }
+  })
+
+  it('counts approval prompts only when asked to', async () => {
+    for (const on of ['questions', 'questions-and-approvals'] as const) {
+      const ctx = new Context()
+      apply(ctx, {
+        baton: true,
+        lendAfterMs: 3_600_000,
+        pauseUnansweredAfterMs: 20,
+        pauseUnansweredOn: on,
+        pausePollMs: 5,
+      })
+      const a = agent('a', 0, { cwd: ALPHA })
+      const b = agent('b', 0, { cwd: BETA })
+      const entered: string[] = []
+      await step(ctx, a, entered)
+      const prompt = approval(ctx, a)
+      const bStep = step(ctx, b, entered)
+      await sleep(60)
+      assert.deepStrictEqual(entered, on === 'questions' ? ['a'] : ['a', 'b'], on)
+      prompt.answer()
+      await prompt.done
+      status(ctx, a, 'idle')
+      await bStep
+      status(ctx, b, 'idle')
+    }
+  })
+
+  it('rejects an unknown pauseUnansweredOn', () => {
+    assert.throws(() => apply(new Context(), { pauseUnansweredOn: 'always' as never }), /pauseUnansweredOn/)
+  })
+})

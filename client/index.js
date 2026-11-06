@@ -84,6 +84,14 @@ window.__ModuleLoader__.load({
       partHeld: '{agents} held',
       partFinishing: '{agents} finishing a step',
       partInTool: '{agents} in a tool call',
+      partAwaitingAnswer: 'waiting for your answer',
+      unansweredTitle: 'Unanswered questions',
+      unansweredAfter: 'Pause after (ms)',
+      unansweredAfterHint:
+        "When an agent's question waits this long for your answer, its workspace pauses so others can use the model. Answering resumes it: it rejoins the queue behind agents already waiting. 0 turns this off. Default 1800000 (30 minutes).",
+      unansweredApprovals: 'Count approval prompts too',
+      unansweredApprovalsHint:
+        'Also pause on a tool approval prompt that waits this long for you, not only on questions.',
       partBaton: 'holds the baton',
       partWaiting: '{agents} waiting for the baton',
       workspacesLoading: 'Loading workspaces…',
@@ -162,6 +170,13 @@ window.__ModuleLoader__.load({
       partHeld: '{agents}已停下',
       partFinishing: '{agents}正在完成当前步骤',
       partInTool: '{agents}在工具调用中',
+      partAwaitingAnswer: '等待你的回答',
+      unansweredTitle: '未回答的问题',
+      unansweredAfter: '暂停等待（毫秒）',
+      unansweredAfterHint:
+        '代理的问题等待你回答这么久后，暂停其工作区，让其他工作区使用模型。回答后恢复：它会排到已在等待的代理之后。0 表示关闭。默认 1800000（30 分钟）。',
+      unansweredApprovals: '审批请求也计入',
+      unansweredApprovalsHint: '工具审批请求等待你这么久时同样暂停，而不仅是问题。',
       partBaton: '持有接力棒',
       partWaiting: '{agents}在等待接力棒',
       workspacesLoading: '正在加载工作区…',
@@ -211,6 +226,16 @@ window.__ModuleLoader__.load({
 
     function nonNegativeIntegerField(field) {
       return integerField(field, 0)
+    }
+
+    /** A field that takes one of a fixed set of strings. */
+    function choiceField(field, choices) {
+      return {
+        field: field,
+        format: (value) => (typeof value === 'string' ? value : ''),
+        parse: (text) =>
+          text === '' ? { kind: 'clear' } : choices.includes(text) ? { kind: 'set', value: text } : undefined,
+      }
     }
 
     var LANE_KEYS = { lane: 'lane', baton: 'baton', limit: 'maxConcurrentSubagents', lend: 'lendAfterMs' }
@@ -950,6 +975,7 @@ window.__ModuleLoader__.load({
       var waiting = row.waiting || 0
       var inTool = row.inTool || 0
       var parts = []
+      if (row.awaitingAnswer === true) paused = true
       if (paused) {
         // Stopped: held at the gate, or queued for the baton (they cannot get
         // it while paused). In a tool: a running tool, or a parent waiting on
@@ -960,6 +986,7 @@ window.__ModuleLoader__.load({
         if (stopped > 0) parts.push(t('partHeld', { agents: agentCount(t, stopped) }))
         if (inTool > 0) parts.push(t('partInTool', { agents: agentCount(t, inTool) }))
         if (finishing > 0) parts.push(t('partFinishing', { agents: agentCount(t, finishing) }))
+        if (row.awaitingAnswer === true) parts.push(t('partAwaitingAnswer'))
       } else {
         parts.push(running > 0 || row.holdsBaton || waiting > 0 ? t('stateRunning') : t('stateIdle'))
         if (running > 0) parts.push(agentCount(t, running))
@@ -1185,6 +1212,31 @@ window.__ModuleLoader__.load({
           h(
             'section',
             { style: section },
+            h('h3', { style: heading }, t('unansweredTitle')),
+            valueField(
+              'unanswered',
+              'pauseUnansweredAfterMs',
+              'unansweredAfter',
+              'unansweredAfterHint',
+              'invalidNonNegative',
+              true,
+            ),
+            h(
+              'div',
+              { style: row },
+              h('span', null, t('unansweredApprovals')),
+              h(ui.Switch, {
+                checked: state.pauseUnansweredOn.text === 'questions-and-approvals',
+                label: t('unansweredApprovals'),
+                disabled: disabled,
+                onChange: (next) => actions.edit('pauseUnansweredOn', next ? 'questions-and-approvals' : 'questions'),
+              }),
+            ),
+            h('p', { style: hint }, t('unansweredApprovalsHint')),
+          ),
+          h(
+            'section',
+            { style: section },
             h('h3', { style: heading }, t('batonTitle')),
             h(
               'div',
@@ -1248,6 +1300,8 @@ window.__ModuleLoader__.load({
         booleanField('baton'),
         nonNegativeIntegerField('lendAfterMs'),
         nonNegativeIntegerField('projectPriorityMs'),
+        nonNegativeIntegerField('pauseUnansweredAfterMs'),
+        choiceField('pauseUnansweredOn', ['questions', 'questions-and-approvals']),
         positiveIntegerField('maxConcurrentSubagents'),
         positiveIntegerField('queueTimeoutMs'),
         nameListField('subagentToolNames'),
@@ -1258,6 +1312,8 @@ window.__ModuleLoader__.load({
           baton: form.field('baton'),
           lendAfterMs: form.field('lendAfterMs'),
           projectPriorityMs: form.field('projectPriorityMs'),
+          pauseUnansweredAfterMs: form.field('pauseUnansweredAfterMs'),
+          pauseUnansweredOn: form.field('pauseUnansweredOn'),
           maxConcurrentSubagents: form.field('maxConcurrentSubagents'),
           queueTimeoutMs: form.field('queueTimeoutMs'),
           subagentToolNames: form.field('subagentToolNames'),
@@ -1385,6 +1441,7 @@ window.__ModuleLoader__.load({
       nonNegativeIntegerField: nonNegativeIntegerField,
       nameListField: nameListField,
       lanesField: lanesField,
+      choiceField: choiceField,
     }
     module.exports.__workspaces = {
       projectKey: projectKey,
