@@ -558,6 +558,30 @@ window.__ModuleLoader__.load({
           else next[providerId] = text
           setDrafts(next)
         }
+        // A change of server drops the rejected drafts of the rows it touches, the lane roots included:
+        // a root row has no input of its own, so its rejected text would come back on a lane it no longer governs.
+        var moveWrite = (providerId, next) => {
+          var touched = new Set([providerId])
+          for (var name of new Set([...Object.keys(map), ...Object.keys(next)])) {
+            const before = laneRoot(map, name)
+            const after = laneRoot(next, name)
+            if (before !== after) {
+              touched.add(name)
+              touched.add(before)
+              touched.add(after)
+            }
+          }
+          var kept = Object.assign({}, drafts)
+          var changed = false
+          for (var key of touched) {
+            if (Object.hasOwn(kept, key)) {
+              delete kept[key]
+              changed = true
+            }
+          }
+          if (changed) setDrafts(kept)
+          write(next)
+        }
 
         var status = null
         // Without a model catalog (no remote, or it went away mid-request)
@@ -623,11 +647,7 @@ window.__ModuleLoader__.load({
                 label: `${t('limitProvider')} ${label}`,
                 disabled: props.disabled || (isRoot && followers.length > 0),
                 title: isRoot && followers.length > 0 ? t('sharedByLocked') : undefined,
-                onChange: (next) => {
-                  // A rejected limit belongs to the row as it was; do not bring it back later.
-                  setDraft(id, undefined)
-                  write(next ? withProvider(map, id) : withoutProvider(map, id))
-                },
+                onChange: (next) => moveWrite(id, next ? withProvider(map, id) : withoutProvider(map, id)),
               }),
               on
                 ? h(
@@ -643,10 +663,7 @@ window.__ModuleLoader__.load({
                           style: control,
                           disabled: props.disabled,
                           value: isRoot ? '' : laneRoot(map, id),
-                          onChange: (event) => {
-                            setDraft(id, undefined)
-                            write(withLane(map, id, event.target.value))
-                          },
+                          onChange: (event) => moveWrite(id, withLane(map, id, event.target.value)),
                         },
                         h('option', { value: '' }, t('ownServer')),
                         roots.map((other) => h('option', { key: other, value: other }, nameOf(other))),
@@ -925,6 +942,15 @@ window.__ModuleLoader__.load({
       }
       // How many mounted composers show each chat; only those are asked about again.
       var watched = new Map()
+      var askLater = (sessionId, delay) => {
+        retries.set(
+          sessionId,
+          setTimeout(() => {
+            retries.delete(sessionId)
+            if (listeners.size > 0 && watched.has(sessionId)) lookup.want(sessionId, true)
+          }, delay),
+        )
+      }
       var lookup = {
         subscribe: (listener) => {
           listeners.add(listener)
@@ -952,7 +978,12 @@ window.__ModuleLoader__.load({
           if (typeof sessionId !== 'string' || sessionId.length === 0 || route.call === undefined) return
           var known = found.get(sessionId)
           if (known !== undefined && known.status !== 'missing') return
-          if (known !== undefined && !retry && Date.now() - known.at < LOOKUP_RETRY_MS) return
+          if (known !== undefined && !retry && Date.now() - known.at < LOOKUP_RETRY_MS) {
+            // Still cooling down after a miss: ask again when the cooldown ends, as a composer may still show it.
+            if (listeners.size > 0 && watched.has(sessionId) && !retries.has(sessionId))
+              askLater(sessionId, LOOKUP_RETRY_MS - (Date.now() - known.at))
+            return
+          }
           clearTimeout(retries.get(sessionId))
           retries.delete(sessionId)
           set(sessionId, { status: 'loading' })
@@ -960,13 +991,7 @@ window.__ModuleLoader__.load({
           var missing = () => {
             set(sessionId, { status: 'missing', at: Date.now() })
             if (listeners.size === 0 || !watched.has(sessionId)) return
-            retries.set(
-              sessionId,
-              setTimeout(() => {
-                retries.delete(sessionId)
-                if (listeners.size > 0 && watched.has(sessionId)) lookup.want(sessionId, true)
-              }, LOOKUP_RETRY_MS),
-            )
+            askLater(sessionId, LOOKUP_RETRY_MS)
           }
           route.request('workspaceOf', { sessionId: sessionId }).then((result) => {
             var value = result?.ok ? result.value : undefined

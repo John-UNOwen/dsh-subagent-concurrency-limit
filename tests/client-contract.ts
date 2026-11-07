@@ -39,6 +39,14 @@ export type PauseForm = [
   Has<ConfigFormSnapshot<unknown>, 'value'>,
 ]
 
+/** The settings form's Save and override markers read these from the form. */
+export type SaveForm = [
+  Has<ConfigForm<unknown>, 'mutate'>,
+  Has<ConfigFormSnapshot<unknown>, 'revision'>,
+  Has<ConfigFormSnapshot<unknown>, 'user'>,
+  Has<ConfigFormSnapshot<unknown>, 'base'>,
+]
+
 /** The workspace route goes through `ctx.connection.rpc.call`. */
 export type Rpc = Has<ClientConnectionRpc, 'call'>
 

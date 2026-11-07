@@ -34,6 +34,7 @@
   },
   "files": [
     "lib",
+    "src",
     "client",
     "cordis.patch.yml",
     "README.md",
@@ -51,7 +52,8 @@
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0",
-    "pnpm": ">=11.7.0"
+    "pnpm": ">=11.7.0",
+    "dsh": ">=0.2.0-rc.2 <0.3.0-0"
   },
   "dsh": {
     "bundle": {
@@ -63,7 +65,8 @@
         "@deepseek-ai/dsh-client-ui-settings",
         "@deepseek-ai/dsh-client-ui-plugin-manager",
         "@deepseek-ai/dsh-api-remotes",
-        "@deepseek-ai/dsh-client-ui-conversation"
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-connection"
       ],
       "platform": "web"
     }

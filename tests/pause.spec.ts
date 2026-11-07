@@ -897,6 +897,51 @@ describe('live settings edits', () => {
     await Promise.all([onA.done, onB.done])
   })
 
+  it('lets two turns switching into each other lanes proceed instead of waiting on each other (#3)', async () => {
+    const ctx = new Context()
+    const providers = { pa: { maxConcurrentSubagents: 1 }, pb: { maxConcurrentSubagents: 1 } }
+    apply(ctx, { maxConcurrentSubagents: 4, queueTimeoutMs: 5_000, providers })
+    const rootA = agent('rootA', 0, { cwd: ALPHA, provider: 'pa' })
+    const rootB = agent('rootB', 0, { cwd: BETA, provider: 'pb' })
+    const c1 = agent('c1', 1, { cwd: ALPHA, provider: 'pa' })
+    const c2 = agent('c2', 1, { cwd: BETA, provider: 'pb' })
+    const entered: string[] = []
+    await delegate(ctx, rootA, 'r1', 'c1', entered)
+    await delegate(ctx, rootB, 'r2', 'c2', entered)
+    await modelStep(ctx, c1, entered, 'pb')
+    await modelStep(ctx, c2, entered, 'pa')
+    // Each turn's next step moves to the other's lane, which only the other frees.
+    const moves = Promise.all([modelStep(ctx, c1, entered, 'pb'), modelStep(ctx, c2, entered, 'pa')])
+    const outcome = await Promise.race([moves.then(() => 'stepped'), sleep(1_000).then(() => 'stuck')])
+    assert.strictEqual(outcome, 'stepped')
+    status(ctx, c1, 'idle')
+    status(ctx, c2, 'idle')
+  })
+
+  it('a turn whose lane switch cannot get room fails at the queue timeout, not sooner (#4)', async () => {
+    const ctx = new Context()
+    const providers = { pa: { maxConcurrentSubagents: 2 }, pb: { maxConcurrentSubagents: 1 } }
+    apply(ctx, { maxConcurrentSubagents: 4, queueTimeoutMs: 300, providers })
+    const root = agent('root', 0, { cwd: ALPHA, provider: 'pa' })
+    const child = agent('child', 1, { cwd: ALPHA, provider: 'pa' })
+    const busy = agent('busy', 0, { cwd: BETA, provider: 'pb' })
+    const entered: string[] = []
+    await delegate(ctx, root, 'r1', 'child', entered)
+    const holder = openTool(ctx, busy, 'subagent', () => {
+      entered.push('holder')
+    })
+    await flush()
+    await modelStep(ctx, child, entered, 'pb')
+    // pb is full: the switch waits its bounded time, then fails instead of running over the limit.
+    const failed = await modelStep(ctx, child, entered, 'pb').then(
+      () => false,
+      (error: Error) => /queue timeout/.test(error.message),
+    )
+    assert.strictEqual(failed, true)
+    holder.finish()
+    await holder.done
+  })
+
   it("gives a lane with no entry of its own the strictest of its providers' settings (#16)", async () => {
     const ctx = new Context()
     const providers = {
@@ -1085,6 +1130,28 @@ describe('pause on an unanswered question', () => {
     status(ctx, c, 'idle')
     await aNext
     assert.deepStrictEqual(entered, ['a', 'b', 'c', 'a'])
+    status(ctx, a, 'idle')
+  })
+
+  it('applies a lowered auto-pause limit to a question already waiting', async () => {
+    const ctx = new Context()
+    const limit = live(60_000)
+    apply(ctx, { baton: true, lendAfterMs: 3_600_000, pauseUnansweredAfterMs: limit, pausePollMs: 5 })
+    const a = agent('a', 0, { cwd: ALPHA })
+    const b = agent('b', 0, { cwd: BETA })
+    const entered: string[] = []
+    await step(ctx, a, entered)
+    const asked = question(ctx, a)
+    const bStep = step(ctx, b, entered)
+    await sleep(10)
+    assert.deepStrictEqual(entered, ['a'])
+    // Lowered mid-wait: the workspace pauses on the new schedule, not the original 60 s.
+    limit.set(20)
+    await bStep
+    assert.deepStrictEqual(entered, ['a', 'b'])
+    asked.answer()
+    await asked.done
+    status(ctx, b, 'idle')
     status(ctx, a, 'idle')
   })
 

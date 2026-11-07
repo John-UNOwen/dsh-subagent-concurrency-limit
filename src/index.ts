@@ -1428,6 +1428,8 @@ export function apply(ctx: Context, config: Config = {}): void {
   const batonLaneOf = new Map<string, Lane>()
 
   const startContext = new AsyncLocalStorage<Reservation>()
+  /** The provider a delegation named when its provider has no lane, so its child is not labelled with the parent's. */
+  const startProvider = new AsyncLocalStorage<string>()
   const startsByRunId = new Map<string, RunState>()
   const activeTurnsByAgentId = new Map<string, object>()
   const pendingByAgentId = new Map<string, Reservation[]>()
@@ -1549,15 +1551,18 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (pending?.length === 0) pendingByAgentId.delete(agentId)
   }
   function expireReservation(agentId: string, reservation: Reservation): void {
-    const timer = setTimeout(() => {
-      reservationTimers.delete(timer)
-      // A reservation a deferred publish bound has nothing left to expire,
-      // but it still leaves the pending list.
-      forgetPending(agentId, reservation)
-      if (reservation.state !== 'open') return
-      reservation.state = 'done'
-      release(reservation)
-    }, settings.pendingReservationMs())
+    const timer = setTimeout(
+      () => {
+        reservationTimers.delete(timer)
+        // A reservation a deferred publish bound has nothing left to expire,
+        // but it still leaves the pending list.
+        forgetPending(agentId, reservation)
+        if (reservation.state !== 'open') return
+        reservation.state = 'done'
+        release(reservation)
+      },
+      Math.min(settings.pendingReservationMs(), MAX_TIMER_MS),
+    )
     timer.unref?.()
     reservationTimers.add(timer)
   }
@@ -1572,17 +1577,13 @@ export function apply(ctx: Context, config: Config = {}): void {
   /**
    * A child whose provider changed mid-turn generates on another lane: move
    * its turn permit there before its next request, so the old lane is not
-   * pinned and the new one counts it. It queues like a root delegation's child
-   * at depth 1; deeper, or with the baton on, it never waits (it may be awaited
-   * by an ancestor), keeping the old permit if the new lane is full.
+   * pinned and the new one counts it. With the baton on it never waits (an
+   * ancestor may be awaiting it): it takes the new lane over its limit.
+   * Without the baton it frees the old permit first and then queues on the
+   * new lane, bounded by queueTimeoutMs, so two turns switching into each
+   * other's lanes cannot wait on each other while holding permits.
    */
-  async function movePermit(
-    agentId: string,
-    held: object,
-    lane: Lane | undefined,
-    signal: AbortSignal,
-    depth: number,
-  ): Promise<void> {
+  async function movePermit(agentId: string, held: object, lane: Lane | undefined, signal: AbortSignal): Promise<void> {
     if (gateOf.get(held) === lane?.gate) return
     if (lane === undefined) {
       releaseTurn(agentId)
@@ -1592,9 +1593,8 @@ export function apply(ctx: Context, config: Config = {}): void {
     enterKey(lane.gate, moved)
     if (lane.batonOn()) {
       if (!lane.gate.tryEnter(moved, signal)) lane.gate.forceEnter(moved)
-    } else if (depth > 1) {
-      if (!lane.gate.tryEnter(moved, signal)) return
     } else {
+      release(held)
       await lane.gate.enter(moved, signal, settings.queueTimeoutMs())
     }
     if (activeTurnsByAgentId.get(agentId) !== held) {
@@ -1694,7 +1694,7 @@ export function apply(ctx: Context, config: Config = {}): void {
         }
         const check = () => {
           if (!workspacePaused(projectByAgent.get(agentId))) finish(resolve)
-          else timer = setTimeout(check, settings.pausePollMs())
+          else timer = setTimeout(check, Math.min(settings.pausePollMs(), MAX_TIMER_MS))
         }
         const onAbort = () => finish(() => reject(signal.reason))
         signal.addEventListener('abort', onAbort, { once: true })
@@ -1703,7 +1703,7 @@ export function apply(ctx: Context, config: Config = {}): void {
           since: Date.now(),
           cancel: (reason) => finish(() => reject(reason)),
         })
-        timer = setTimeout(check, settings.pausePollMs())
+        timer = setTimeout(check, Math.min(settings.pausePollMs(), MAX_TIMER_MS))
       })
     } finally {
       for (const lane of lanes.values()) lane.baton.unhold(agentId)
@@ -1717,9 +1717,11 @@ export function apply(ctx: Context, config: Config = {}): void {
     'subagent concurrency pause gate',
   )
 
-  // Prepended so no other step or tool listener runs ahead of the pause gate
-  // and the baton. The lane here is a best guess; `agent/request` corrects it
-  // with the real route.
+  // Prepended to run ahead of the plugin's other step listeners, so the pause
+  // gate and the baton come first among them. Host listeners that also prepend
+  // may run earlier; each awaits next() before acting, so the order is a host
+  // convention, not a guarantee. The lane here is a best guess; `agent/request`
+  // corrects it with the real route.
   ctx.on(
     'agent/pre-step',
     async (info, next) => {
@@ -1782,27 +1784,43 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   /** Run a wait for the user's answer; past pauseUnansweredAfterMs its workspace pauses until it ends. */
   async function awaitUser<T>(agentId: string, kind: 'question' | 'approval', run: () => Promise<T>): Promise<T> {
-    const limit = settings.pauseUnansweredAfterMs()
-    if (limit <= 0 || (kind === 'approval' && settings.pauseUnansweredOn() !== 'questions-and-approvals')) return run()
+    const started = Date.now()
     let paused: string | undefined
-    const timer = setTimeout(
-      () => {
-        answerTimers.delete(timer)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const counts = (): boolean => kind === 'question' || settings.pauseUnansweredOn() === 'questions-and-approvals'
+    const arm = (delay: number): void => {
+      timer = setTimeout(check, Math.min(Math.max(delay, 1), MAX_TIMER_MS))
+      timer.unref?.()
+      answerTimers.add(timer)
+    }
+    // Re-reads the limit at every check, so a live edit applies to a wait already in progress.
+    const check = (): void => {
+      if (timer !== undefined) answerTimers.delete(timer)
+      timer = undefined
+      const limit = settings.pauseUnansweredAfterMs()
+      const elapsed = Date.now() - started
+      const enabled = limit > 0 && counts()
+      if (enabled && elapsed >= limit) {
         const project = projectByAgent.get(agentId)
-        if (project === undefined) return
-        paused = project
-        unanswered.set(project, (unanswered.get(project) ?? 0) + 1)
-        refreshBatons()
-      },
-      Math.min(limit, MAX_TIMER_MS),
-    )
-    timer.unref?.()
-    answerTimers.add(timer)
+        if (project !== undefined) {
+          paused = project
+          unanswered.set(project, (unanswered.get(project) ?? 0) + 1)
+          refreshBatons()
+          return
+        }
+      }
+      // Wake when the limit is due, or at the poll interval so a change is noticed.
+      const due = enabled && elapsed < limit ? limit - elapsed : Infinity
+      arm(Math.min(settings.pausePollMs(), due))
+    }
+    check()
     try {
       return await run()
     } finally {
-      clearTimeout(timer)
-      answerTimers.delete(timer)
+      if (timer !== undefined) {
+        clearTimeout(timer)
+        answerTimers.delete(timer)
+      }
       if (paused !== undefined) {
         const left = (unanswered.get(paused) ?? 1) - 1
         if (left > 0) unanswered.set(paused, left)
@@ -1879,8 +1897,11 @@ export function apply(ctx: Context, config: Config = {}): void {
     const requested = (exec.arguments as { provider?: unknown } | undefined)?.provider
     const provider = typeof requested === 'string' && requested.length > 0 ? requested : providerOf(exec.agent)
     const lane = laneFor(provider)
-    // A provider with no lane is not limited.
-    if (lane === undefined) return next()
+    // A provider with no lane is not limited, but the child it publishes still
+    // runs on the provider the call named, not on its parent's.
+    if (lane === undefined) {
+      return typeof requested === 'string' && requested.length > 0 ? startProvider.run(requested, next) : next()
+    }
     const gate = lane.gate
     const root = delegationDepthOf(exec.agent) === 0
     const reservation: Reservation = { state: 'open', lane, provider }
@@ -1937,7 +1958,10 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (ownedReservation !== undefined && parentId !== undefined) forgetPending(parentId, ownedReservation)
     const parentProject = parentId === undefined ? undefined : projectByAgent.get(parentId)
     if (parentProject !== undefined && !projectByAgent.has(childId)) projectByAgent.set(childId, parentProject)
-    const expected = reservation?.provider ?? (parentId === undefined ? undefined : observedProvider.get(parentId))
+    const expected =
+      reservation?.provider ??
+      startProvider.getStore() ??
+      (parentId === undefined ? undefined : observedProvider.get(parentId))
     if (info.local && expected !== undefined && !observedProvider.has(childId)) expectedProvider.set(childId, expected)
 
     // The baton follows the child only within one lane: a child on another
@@ -1985,7 +2009,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (delegationDepthOf(info.agent) === 0) return next()
     const current = activeTurnsByAgentId.get(agentId)
     if (current !== undefined) {
-      await movePermit(agentId, current, laneFor(providerOf(info.agent)), info.signal, delegationDepthOf(info.agent))
+      await movePermit(agentId, current, laneFor(providerOf(info.agent)), info.signal)
       return next()
     }
 
@@ -2024,10 +2048,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       } else {
         await queueTurn(agentId, gate, lease, info.signal)
       }
-      if (run?.ended) {
-        gate.release(lease)
-        return next()
-      }
+      // A run that ended while this turn queued still has a turn to run: it
+      // keeps its permit and is tracked like any other turn until it goes idle.
       if (run !== undefined) run.lease = lease
       activeTurnsByAgentId.set(agentId, lease)
       try {

@@ -71,6 +71,18 @@ function end(ctx: Context, runId: string, childId: string): void {
 }
 
 /** A delegation that publishes `childId` inside the call and records `label`. */
+/** A step whose model request names `provider`, so the agent's provider is observed. */
+function requestStep(ctx: Context, a: Agent, provider: string): Promise<PreStepDecision> {
+  return step(ctx, a, [], async () => {
+    await agentEvents(ctx, a).waterfall(
+      'agent/request',
+      { turn: 1, step: 1, signal: new AbortController().signal },
+      () => Promise.resolve({ provider, model: 'm' } as never),
+    )
+    return { kind: 'enter', messages: [] }
+  })
+}
+
 function delegate(ctx: Context, a: Agent, label: string, childId: string, entered: string[], name = 'subagent') {
   return tool(
     ctx,
@@ -278,4 +290,46 @@ describe('review findings', () => {
       end(ctx, 'first', 'child-first')
     })
   }
+  it('#2 labels a child of an unlisted provider with the provider its call named, not its parent lane', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 4, queueTimeoutMs: 300, providers: { p: { maxConcurrentSubagents: 1 } } })
+    const root = agent('root', 0, { provider: 'p' })
+    const entered: string[] = []
+    await requestStep(ctx, root, 'p')
+    // The call names q, which has no lane: the child runs there and must not hold p's only permit.
+    await tool(
+      ctx,
+      root,
+      () => {
+        start(ctx, 'rq', 'qc')
+        return Promise.resolve(result())
+      },
+      { name: 'subagent', args: { provider: 'q' } },
+    )
+    await requestStep(ctx, agent('qc', 1), 'q')
+    await delegate(ctx, root, 'pc-call', 'pc', entered)
+    assert.deepStrictEqual(entered, ['pc-call'])
+  })
+
+  it('#13 a queued turn whose run ended keeps its permit while it runs (#13)', async () => {
+    const ctx = new Context()
+    apply(ctx, { maxConcurrentSubagents: 4, queueTimeoutMs: 5_000, providers: { p: { maxConcurrentSubagents: 1 } } })
+    const root = agent('root', 0, { provider: 'p' })
+    const entered: string[] = []
+    await delegate(ctx, root, 'r1', 'c1', entered)
+    await step(ctx, agent('c1', 1, { provider: 'p' }), entered)
+    await delegate(ctx, root, 'wf', 'c2', entered, 'workflow')
+    const c2Step = step(ctx, agent('c2', 1, { provider: 'p' }), entered)
+    await flush()
+    // c2's run ends while its turn is queued; the turn still runs.
+    end(ctx, 'wf', 'c2')
+    const r3 = delegate(ctx, root, 'r3', 'c3', entered)
+    status(ctx, agent('c1', 1, { provider: 'p' }), 'idle')
+    await c2Step
+    await flush()
+    assert.deepStrictEqual(entered, ['r1', 'c1', 'wf', 'c2'])
+    status(ctx, agent('c2', 1, { provider: 'p' }), 'idle')
+    await r3
+    assert.deepStrictEqual(entered, ['r1', 'c1', 'wf', 'c2', 'r3'])
+  })
 })

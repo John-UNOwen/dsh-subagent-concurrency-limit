@@ -797,9 +797,9 @@ describe('client provider editor (checkup)', () => {
     },
   }
 
-  async function providersOf(text: string) {
+  async function providersOf(text: string, extra: Extra = {}) {
     const client = loadClient({ providers: text })
-    const { registrations } = apply(client.loaded, CATALOG3)
+    const { registrations } = apply(client.loaded, CATALOG3, extra)
     await tick()
     const card = registrations[0]?.component
     assert.ok(card)
@@ -845,6 +845,31 @@ describe('client provider editor (checkup)', () => {
     )
     for (const select of selects.slice(1))
       assert.ok(findAll(select, (el) => el.type === 'option').some((el) => el.props?.value === 'gpu-a'))
+  })
+
+  it('drops a rejected limit on a lane root when its followers move away and back (#12)', async () => {
+    const { render, edits } = await providersOf('gpu-b: lane=gpu-a limit=2')
+    const limitInput = () => findAll(render(), (el) => el.type === 'input')[0]
+    fire(limitInput(), 'onChange', { target: { value: '0' } })
+    assert.strictEqual(limitInput()?.props?.['aria-invalid'], true)
+    // gpu-b is the select showing gpu-a: move it to its own server, then back.
+    const followerSelect = () =>
+      findAll(render(), (el) => el.type === 'select').find((el) => el.props?.value === 'gpu-a')
+    fire(followerSelect(), 'onChange', { target: { value: '' } })
+    fire(findAll(render(), (el) => el.type === 'select')[0], 'onChange', { target: { value: 'gpu-a' } })
+    assert.deepStrictEqual(edits.at(-1), ['providers', 'gpu-b: lane=gpu-a limit=2; gpu-a: limit=2'])
+    assert.strictEqual(limitInput()?.props?.['aria-invalid'], false)
+    assert.strictEqual(limitInput()?.props?.value, '2')
+  })
+
+  it('shows the pending note in the providers editor while a lanes edit waits (#17)', async () => {
+    const rpc = async (_channel: string, endpoint: string) =>
+      endpoint === 'workspaces'
+        ? { ok: true, value: { paused: [], workspaces: [], providersPending: true } }
+        : { ok: false, error: { message: 'unknown endpoint' } }
+    const { render } = await providersOf('gpu-a: limit=4', { rpc })
+    await tick()
+    assert.ok(JSON.stringify(render()).includes('providersPending'))
   })
 
   it('keeps a rejected limit on screen with an error and stages nothing (#10)', async () => {
@@ -970,10 +995,11 @@ describe('client composer and writes (checkup)', () => {
     const route = w.createRoute()
     const lookup = w.createWorkspaceLookup(route)
     const off = lookup.subscribe(() => {})
+    releases.push(off)
     // A composer shown before the connection is up asks nothing yet.
     const stop = lookup.watch('chat-a')
     assert.strictEqual(lookup.getSnapshot().get('chat-a'), undefined)
-    const fake = fakeRoute(ROWS, { 'chat-a': { key: 'c:/work/a', path: 'C:\Work\A' } })
+    const fake = fakeRoute(ROWS, { 'chat-a': { key: 'c:/work/a', path: 'C:\\Work\\A' } })
     route.set((endpoint: string, payload: unknown) => fake.rpc('/subagent-concurrency-limit', endpoint, payload))
     await tick()
     assert.strictEqual(lookup.getSnapshot().get('chat-a')?.status, 'ready')
@@ -1001,6 +1027,7 @@ describe('client composer and writes (checkup)', () => {
     let reply: unknown = { ok: true, value: { workspaces: [], providersPending: true } }
     route.set(async () => reply)
     const off = list.subscribe(() => {})
+    releases.push(off)
     await tick()
     assert.strictEqual(list.getSnapshot().status, 'ready')
     assert.strictEqual(list.getSnapshot().providersPending, true)
@@ -1010,6 +1037,31 @@ describe('client composer and writes (checkup)', () => {
     assert.strictEqual(list.getSnapshot().status, 'error')
     assert.strictEqual(list.getSnapshot().providersPending, true)
     off()
+  })
+
+  it('asks again for a chat missed inside the cooldown, once it ends (#11)', async (t2) => {
+    t2.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+    const client = loadClient()
+    const route = fakeRoute(ROWS, {})
+    const button = apply(client.loaded, undefined, { rpc: route.rpc, pauseForm: fakePauseForm([]).form })
+      .registrations[1]
+    assert.ok(button)
+    const render = (sessionId: string) => {
+      client.beginRender()
+      return button.component({ t, sessionId })
+    }
+    render('chat-a')
+    await tick()
+    t2.mock.timers.tick(1000)
+    // Switched away and back inside the 5 s cooldown.
+    render('chat-b')
+    await tick()
+    render('chat-a')
+    await tick()
+    t2.mock.timers.tick(5000)
+    await tick()
+    const asked = route.calls.filter((call) => (call.payload as { sessionId?: string })?.sessionId === 'chat-a')
+    assert.strictEqual(asked.length, 2)
   })
 
   it('retries a pause write once after a transport failure (#25)', async (t2) => {
